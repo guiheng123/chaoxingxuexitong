@@ -3,7 +3,8 @@
 // @namespace    local.chaoxing.auto
 // @version      1.6.1
 // @description  自动播放/静音/倍速/防暂停/自动下一节；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
-// @author       -
+// @license MIT
+// @author       guiheng123
 // @match        *://*.chaoxing.com/*
 // @match        *://*.chaoxing.com.cn/*
 // @match        *://*.chaoxing.com:8080/*
