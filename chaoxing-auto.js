@@ -3,7 +3,8 @@
 // @namespace    local.chaoxing.auto
 // @version      1.7.0
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
-// @author       -
+// @license      MIT
+// @author       guiheng123
 // @match        *://*.chaoxing.com/*
 // @match        *://*.chaoxing.com.cn/*
 // @match        *://*.chaoxing.com:8080/*
@@ -149,7 +150,7 @@
     // ---- 视频 ----
     videoEnabled: true,
     videoMute: true,           // 静音（浏览器允许静音自动播放）
-    videoSpeed: 2,             // 倍速，1 / 1.25 / 1.5 / 2。超过 2 有被判异常的风险
+    videoSpeed: 1,             // 倍速，1 / 1.25 / 1.5 / 2。超过 2 有被判异常的风险
     keepPlaying: true,         // 被暂停/切屏后自动恢复播放（带熔断，不会和页面拉锯）
     /*
      * 视频已有播放进度时，尝试直接跳到结尾**一次**。
@@ -290,7 +291,7 @@
 
     // ---- 其它 ----
     debug: false,              // 输出 console 日志。排查问题时再打开
-    logEnabled: true,          // 收集运行日志到面板。完全不想有日志开销可以关掉
+    logEnabled: false,          // 收集运行日志到面板。完全不想有日志开销可以关掉
     panelCollapsed: false,
   };
 
