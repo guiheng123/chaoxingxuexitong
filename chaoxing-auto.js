@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.6.1
-// @description  自动播放/静音/倍速/防暂停/自动下一节；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
-// @license MIT
-// @author       guiheng123
+// @version      1.7.0
+// @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
+// @author       -
 // @match        *://*.chaoxing.com/*
 // @match        *://*.chaoxing.com.cn/*
 // @match        *://*.chaoxing.com:8080/*
@@ -60,6 +59,16 @@
  *    视频 / 文档模块自己仍有一道**本地**确认流程（到达末尾 → 等上报沉淀 →
  *    校验所有分段都结束 → 等"已完成"标记，见 VideoModule.onMediaEnd）。它只决定
  *    "这个任务点我这边收工了没有"，**不再决定要不要跳转** —— 那是第 8 节唯一的事。
+ *
+ *    **整门课都做完之后不再往下跳，而是回个人空间**（v1.7.0 新增，
+ *    开关 gotoSpaceWhenDone）。判据同样是超星自己的数据，不用"猜"：
+ *      1) 目录里再也找不到任何一个值 > 0 的 `input.jobUnfinishCount`
+ *         （超星只给**还有没做完的任务点**的章节渲染这个隐藏 input）
+ *      2) 当前项已经是目录里最后一个**可导航**的小节
+ *      3) 上面两条连续两轮都成立
+ *    刻意**不要求**当前章节有完成标记 —— 目录末尾常常是"没有任务点的收尾小节"，
+ *    超星不给它画勾，只认勾就会永远卡在那一节反复点「下一节」。
+ *    三条缺一不可的理由见 NextModule.courseAllDone()。
  *
  * 5) 【性能与稳定性约束 —— 改代码前务必先读这段】
  *    这个脚本会同时跑在超星页面的**每一个** frame 里，而超星本身是重 DOM 的重应用，
@@ -122,6 +131,20 @@
     '- 即使不确定也必须给出最可能的答案，不要留空、不要写"无法确定"。',
   ].join('\n');
 
+  /*
+   * 个人空间默认地址 —— 抽成常量，因为它有**两个**使用点：
+   *   1) DEFAULT_CONFIG.spaceUrl 的默认值
+   *   2) gotoSpace() 的兜底（用户把地址清空、或填了非 http(s) 时回落）
+   *
+   * 两处各写一遍迟早会不一致 —— v1.4.2 的版本号写了两处，升级时漏改一处，
+   * 用户导出的日志标着错版本，排查时被误导。同一个错误不犯第二次。
+   *
+   * 真机实测（2026-09-24）：`https://i.mooc.chaoxing.com/space/index` 就是
+   * 超星「我的空间」（"我学的课"列表），去掉原来那串 `?ws=2&t=<时间戳>`
+   * （t 只是防缓存）照样能打开，所以默认值用干净地址。
+   */
+  const SPACE_URL_DEFAULT = 'https://i.mooc.chaoxing.com/space/index';
+
   const DEFAULT_CONFIG = {
     // ---- 视频 ----
     videoEnabled: true,
@@ -144,6 +167,23 @@
     videoJumpMinProgress: 5,
     autoNext: true,            // 本节确认完成后自动切下一节
     nextDelay: 4000,           // 确认完成后，再等多少毫秒切下一节
+    /*
+     * 整门课的任务点全部做完之后，跳转到**个人空间**。
+     *
+     * 为什么需要它：没有这个开关时，最后一节做完后 goNext() 只能去点页面上那个
+     * 常驻的「下一节」按钮 —— 点它要么弹一句"已经是最后一节"，要么什么都不发生，
+     * 然后每 10 秒重复一次，永远停在那里。用户要的是"刷完了就回空间"。
+     *
+     * 判定收在 NextModule.courseAllDone() 里，**不是**"当前章节打勾了"就跳 ——
+     * 目录末尾常常是"没有任务点的收尾小节"，超星不会给它画勾。
+     * 见 courseAllDone() 的说明。
+     */
+    gotoSpaceWhenDone: true,
+    /*
+     * 个人空间地址。默认值见文件上方的 SPACE_URL_DEFAULT（超星「我的空间」）。
+     * 面板里可改，兼容其它部署 / 单点登录入口。
+     */
+    spaceUrl: SPACE_URL_DEFAULT,
     /*
      * 侵入式反暂停：篡改 document.hidden / visibilityState 并拦截 visibilitychange。
      *
@@ -263,7 +303,7 @@
    * 升到 1.4.3 时就漏改了，用户拿到的日志会标错版本，排查时被误导。
    * bench/version-test.js 会强制校验这两处相等。
    */
-  const SCRIPT_VERSION = '1.6.1';
+  const SCRIPT_VERSION = '1.7.0';
   /*
    * v1.3.0 答题配置里的占位地址。
    * 它跟 v1.4.0 的默认值不同，所以在做"用户是否改过地址"的判断时必须显式排除，
@@ -7347,6 +7387,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           <div class="row"><span>静音</span><input type="checkbox" id="videoMute" ${c.videoMute ? 'checked' : ''}></div>
           <div class="row"><span>防暂停</span><input type="checkbox" id="keepPlaying" ${c.keepPlaying ? 'checked' : ''}></div>
           <div class="row"><span>自动下一节</span><input type="checkbox" id="autoNext" ${c.autoNext ? 'checked' : ''}></div>
+          <div class="row"><span>刷完回个人空间</span><input type="checkbox" id="gotoSpaceWhenDone" ${c.gotoSpaceWhenDone ? 'checked' : ''}></div>
+          <div class="row"><span>空间地址</span><input type="text" id="spaceUrl" value="${esc(c.spaceUrl)}" placeholder="${SPACE_URL_DEFAULT}"></div>
           <div class="row"><span>倍速</span>
             <select id="videoSpeed">
               ${[1, 1.25, 1.5, 1.75, 2].map((s) => `<option value="${s}" ${Number(c.videoSpeed) === s ? 'selected' : ''}>${s}x</option>`).join('')}
@@ -7368,7 +7410,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
             <span style="display:block;margin-bottom:4px">完成标记选择器（逗号分隔）</span>
             <textarea id="completeSelectors">${esc(c.completeSelectors)}</textarea>
           </div>
-          <p class="tip"><b>自动下一节</b>的唯一依据是<b>目录里当前章节的完成标记</b>：显示「已完成」就点下一节，没显示就一直等。上面这个选择器对不上，脚本就永远不跳 —— 点「诊断」能看到每个选择器命中了几个元素。<br>「跳转前确认完成」只作用于视频 / 文档自己的本地确认流程，<b>不再决定要不要跳转</b>。</p>
+          <p class="tip"><b>自动下一节</b>的唯一依据是<b>目录里当前章节的完成标记</b>：显示「已完成」就点下一节，没显示就一直等。上面这个选择器对不上，脚本就永远不跳 —— 点「诊断」能看到每个选择器命中了几个元素。<br>「跳转前确认完成」只作用于视频 / 文档自己的本地确认流程，<b>不再决定要不要跳转</b>。<br><b>刷完回个人空间</b>：整门课的任务点都做完时，整页跳到上面那个地址（默认超星「我的空间」）。判据是<b>目录里再也没有「N个待完成任务点」</b>＋<b>已经走到最后一节</b>＋连续两轮都成立，<b>不要求</b>最后一节自己有完成标记（目录末尾常常是没有任务点的收尾小节）。想刷完停在原地就把它关掉。</p>
         </div>
 
         <div class="sec">
@@ -7489,6 +7531,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       bindToggle('keepPlaying', 'keepPlaying');
       bindToggle('videoJumpToEnd', 'videoJumpToEnd');
       bindToggle('autoNext', 'autoNext');
+      bindToggle('gotoSpaceWhenDone', 'gotoSpaceWhenDone');
       bindToggle('aggressiveAntiPause', 'aggressiveAntiPause');
       bindToggle('requireComplete', 'requireComplete');
       bindToggle('docEnabled', 'docEnabled');
@@ -7507,6 +7550,25 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         const n = Math.max(0, Math.min(600, Number(e.target.value) || 0));
         e.target.value = n;
         saveConfig({ videoJumpMinProgress: n });
+      });
+
+      /*
+       * 空间地址：改完失焦就存，跟上面那个数字框同一套做法（旁边的复选框是即时的，
+       * 这一格要是还得手动点「保存」就很容易漏）。
+       *
+       * 只收 http/https：`location.href = 'javascript:…'` 在多数浏览器里是会**执行**的。
+       * gotoSpace() 里还有一道同样的校验 —— 配置是从 GM 存储读回来的，用户也可能手改
+       * 存储，只在面板这一侧拦是不够的。
+       */
+      $('spaceUrl').addEventListener('change', (e) => {
+        const v = e.target.value.trim();
+        if (v && !/^https?:\/\//i.test(v)) {
+          warn('空间地址必须以 http:// 或 https:// 开头，本次修改已忽略');
+          e.target.value = CONFIG.spaceUrl;
+          return;
+        }
+        e.target.value = v;
+        saveConfig({ spaceUrl: v });
       });
 
       // 作答方式 / 重试次数。重试次数要夹在 0~5，用户手输 999 会把接口打爆。
@@ -7568,6 +7630,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         completeSelectors: $('completeSelectors').value.trim(),
         reportSettleMs: Math.max(0, Number($('reportSettleMs').value) || 0),
         completeWaitMs: Math.max(3000, Number($('completeWaitMs').value) || 25000),
+        spaceUrl: $('spaceUrl').value.trim(),
       });
 
       $('btnSave').onclick = () => {
@@ -7627,6 +7690,10 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           `活动定时器: ${Timers.count()}`,
           `熔断器: ${breaker.snapshot()}`,
           `日志队列: ${logQueue.length}`,
+          '',
+          `自动下一节: ${CONFIG.autoNext ? '开' : '关'}`,
+          `刷完回空间: ${CONFIG.gotoSpaceWhenDone ? `开 → ${CONFIG.spaceUrl || SPACE_URL_DEFAULT}` : '关'}`,
+          `收工判定: ${NextModule.finishReport()}`,
           '',
           `答题开关: ${CONFIG.answerEnabled ? '开' : '关（开了才会观察题目）'}`,
           `自动提交: ${CONFIG.autoSubmit ? '开' : '关（关了脚本不会自动点提交）'}`,
@@ -8012,6 +8079,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     holdKey: '',        // 上次记过的"不推进原因"（同一个原因只打一次日志）
     seqVideos: null,    // 上次顺序编排时的视频列表（判断"编排结果变没变"）
     seqActiveIdx: -1,   // 上次顺序编排选中的下标（-1 = 全部已到完成线）
+    finishStrikes: 0,   // "整门课都做完了"连续成立了几轮（见 courseAllDone）
+    spaceJumped: false, // 已经跳去个人空间了（一次性，防止跳转落地前又跑一轮）
 
     /*
      * 「超星标记迟到」的宽限时长。
@@ -8036,6 +8105,15 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
      */
     TAB_SWITCH_COOLDOWN: 8000,
 
+    /*
+     * 「整门课都做完了」要连续成立几轮才认。
+     *
+     * 一轮 = POLL_MS（3 秒）。代价是刷完最后一节后多等几秒才回空间，
+     * 换来的是不会在"刚跳完一节、目录还在重建"的那一两轮里误判 —— 误判的后果是
+     * 课程做到一半被整页跳走、自动化直接断掉，比多等 3 秒严重得多。
+     */
+    FINISH_STRIKES: 2,
+
     start() {
       if (!CONFIG.autoNext) {
         log('「自动下一节」是关的 —— 只广播目录状态，不做跳转');
@@ -8059,6 +8137,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           // 和答题的观察循环同一个原则：一次异常绝不能把长期循环整个杀死
           warn('下一节检查异常（已忽略，继续观察）:', e.message || e);
         }
+        /*
+         * 收工跳转（gotoSpace）会把 loopTimer 清掉并置 spaceJumped —— 那时候
+         * **不能**再排下一轮。否则这个 tick 刚清完就又被自己注册回去，
+         * 循环根本停不下来：跳转生效前的那几百毫秒里还能再点一次「下一节」。
+         */
+        if (this.spaceJumped) return;
         this.loopTimer = Timers.after(tick, this.POLL_MS);
       };
       this.loopTimer = Timers.after(tick, firstDelay == null ? this.POLL_MS : firstDelay);
@@ -8094,6 +8178,22 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (!CONFIG.autoNext) return;
       if (this.cooldown()) return;
 
+      /*
+       * ★ 整门课都做完了 → 去个人空间，而不是对着最后一节反复点「下一节」。
+       *
+       * 位置有讲究，两点都不能挪：
+       *   · 必须在 chapterTaskDone 判断**之前**。否则最后一节做完时会先走 goNext()，
+       *     而那时目录里已经没有下一项，它会退回点页面上那个常驻的「下一节」按钮 ——
+       *     点了什么都不会发生，于是每 10 秒重复一次，永远回不了空间。
+       *   · 也**不能**挂到 chapterTaskDone 里面（即"当前章节打勾了才考虑收工"）。
+       *     目录末尾常常是"没有任务点的收尾小节"，超星不给它画完成标记，
+       *     挂在那下面就永远走不到这里。安全性由 courseAllDone() 自己兜底。
+       */
+      if (CONFIG.gotoSpaceWhenDone && this.courseAllDone(item)) {
+        this.gotoSpace();
+        return;
+      }
+
       if (this.chapterTaskDone(item)) {
         this.goNext();
         return;
@@ -8120,6 +8220,163 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       const n = item || this.currentCatalogItem();
       if (!n) return false;
       try { return Completeness.markFound(n); } catch (e) { return false; }
+    },
+
+    /* ------------------------------------------------------------
+     * 整门课的收尾：全部做完 → 回个人空间（v1.7.0）
+     *
+     * 这一组和上面的 chapterTaskDone 管的是两个不同的问题，别混：
+     *   chapterTaskDone  —— "当前这一节能不能往下走了"（只看当前项）
+     *   courseAllDone    —— "这门课还有没有活干"（扫全目录）
+     *
+     * 为什么不能只靠"当前章节打勾了"：目录末尾常常是"没有任务点的收尾小节"
+     * （课程总结、考试说明之类），超星不会给它画完成标记 → chapterTaskDone 永远
+     * false → 脚本卡在最后一节反复点「下一节」。真机上这类小节是常态，不是边角。
+     * ------------------------------------------------------------ */
+
+    /**
+     * 目录里还有没有任何一个「未完成任务点」。
+     *
+     * 权威依据是目录项里那个隐藏的 `input.jobUnfinishCount` —— 超星**只给还有没做完
+     * 的任务点的章节渲染它**，已完成的章节根本没有这个元素（这一条是 unfinishCount()
+     * 早就依赖的事实）。所以"整门课都做完了"等价于：
+     *
+     *     目录里再也找不到任何一个值 > 0 的 jobUnfinishCount
+     *
+     * ⚠️ 这是**全目录扫描**，和 chapterTaskDone() 只看当前项刚好相反 —— 故意的。
+     * 单看当前项无法回答"前面有没有漏做的"（用户可能手动跳章过来）。
+     *
+     * 读不到目录（一个项都没有）时返回 true = "还有活"，即**不认收工**。
+     * 宁可不动，也不抢跑 —— 和"章节导航按钮是常驻的，所以不能拿它当依据"同一条原则。
+     */
+    unfinishedAnywhere() {
+      let items = [];
+      try { items = this.catalogItems(); } catch (e) { return true; }
+      if (!items.length) return true;
+      for (const n of items) {
+        const v = this.unfinishCount(n);
+        if (v != null && v > 0) return true;
+      }
+      return false;
+    },
+
+    /**
+     * 这一页的目录是不是在用**我们认识的那套完成标记**。
+     *
+     * 用来把"整门课做完了"和"超星改版了、我们根本没读懂这个页面"分开。
+     * 后者的典型症状：目录里既没有 jobUnfinishCount、也没有任何完成标记 ——
+     * 只按 unfinishedAnywhere() 判的话会算出"没活了"，于是在课程中途跳去个人空间。
+     *
+     * 判据是**目录里任何一项**带完成标记即可。整门课做完时每节都带标记，
+     * 所以正常收尾一定过；而"什么都没做的新课"过不了 —— 那正是我们想要的保守方向
+     * （用户手动翻到最后一节看看，不该被踢出去）。
+     */
+    markAliveAnywhere() {
+      let items = [];
+      try { items = this.catalogItems(); } catch (e) { return false; }
+      for (const n of items) {
+        try { if (Completeness.markFound(n)) return true; } catch (e) { /* 下一项 */ }
+      }
+      return false;
+    },
+
+    /**
+     * 整门课是不是已经全部做完（＝可以回个人空间了）。
+     *
+     * 四条**同时**成立才算，缺一不可：
+     *
+     *   1. 目录里没有任何一项还挂着未完成任务点计数  → unfinishedAnywhere()
+     *   2. 目录里确实在用我们认识的完成标记          → markAliveAnywhere()
+     *   3. 当前项已经是目录里最后一个**可导航**的小节 → 后面没有「下一节」可跳
+     *   4. 上面三条连续 FINISH_STRIKES 轮都成立
+     *
+     * 条件 1 是"活干完了"，条件 2 是"这个页面我们读得懂"，条件 3 是"已经走到头了"。
+     *
+     * 条件 3 不能省。它是唯一能把"整门课做完"和"目录没渲染全"区分开的信号：
+     * 目录只在课程页存在，切章 / 刷新的一瞬间可能只渲染出一部分，那时条件 1 会
+     * **假成立** —— 只认它就会在课程做到一半时整页跳走，自动化直接断掉。
+     * 加上"已经在最后一节"把这个窗口基本堵死。
+     *
+     * 条件 4 同理，防的是"刚跳到最后一节、目录还在重建"的那一两轮。
+     *
+     * ⚠️ 这里**刻意不要求**当前章节有完成标记，见本区块开头的说明。
+     */
+    courseAllDone(item) {
+      const n = item || this.currentCatalogItem();
+      if (!n) { this.finishStrikes = 0; return false; }
+
+      if (this.unfinishedAnywhere() || !this.markAliveAnywhere()) {
+        this.finishStrikes = 0;
+        return false;
+      }
+
+      let items = [];
+      try { items = this.catalogItems(); } catch (e) { items = []; }
+      const curIdx = this.activeCatalogIndex(items);
+      if (curIdx < 0 || this.nextCatalogItem(items, curIdx)) {
+        this.finishStrikes = 0;
+        return false;
+      }
+
+      this.finishStrikes++;
+      return this.finishStrikes >= this.FINISH_STRIKES;
+    },
+
+    /**
+     * 诊断用：把"能不能收工"的每一条判据的当前值摊开。
+     *
+     * 「刷完了却没回个人空间」只看日志很难定位 —— 日志里全是"目录状态：当前章节已完成"
+     * 这种正常输出，看不出是哪一条卡住了。这里逐条报出来，最常见的原因是
+     * **完成标记选择器对不上**（那条会明确写出来）。
+     */
+    finishReport() {
+      let items = [];
+      try { items = this.catalogItems(); } catch (e) { items = []; }
+      const curIdx = this.activeCatalogIndex(items);
+      const next = curIdx >= 0 ? this.nextCatalogItem(items, curIdx) : null;
+      return [
+        `未完成任务点 ${this.unfinishedAnywhere() ? '**还有**' : '无'}`,
+        `完成标记 ${this.markAliveAnywhere() ? '在用' : '**没读到**（选择器对不上？）'}`,
+        `下一节 ${next ? '还有' : '无（已在最后一节）'}`,
+        `连续成立 ${this.finishStrikes}/${this.FINISH_STRIKES}`,
+        this.spaceJumped ? '已跳转' : '',
+      ].filter(Boolean).join(' / ');
+    },
+
+    /**
+     * 跳转到个人空间 —— 本模块唯一一次"整页跳走"。
+     *
+     * 用 `location.href` 整页跳转，不用 window.open：课都刷完了就该离开这一页，
+     * 再留一个后台标签没有意义，而且会被浏览器的弹窗拦截器挡掉（不是用户手势）。
+     *
+     * 跳转前**先停掉主循环**：`location.href` 的赋值不是同步生效的，页面还要走完
+     * 卸载流程，这中间主循环可能又跑一轮、再点一次「下一节」—— 那就跳不成了。
+     * 顺手把 spaceJumped 立起来，双保险。
+     */
+    gotoSpace() {
+      if (this.spaceJumped) return;
+      this.spaceJumped = true;
+
+      /*
+       * 地址只认 http/https。
+       *
+       * `location.href = 'javascript:…'` 在多数浏览器里是会**执行**的，而配置是从
+       * GM 存储读回来的、用户也可能手改存储。这一条把"配置里塞进一个伪协议"变成
+       * 无害的回落，成本是一行正则。
+       */
+      const raw = String(CONFIG.spaceUrl || '').trim();
+      const url = /^https?:\/\//i.test(raw) ? raw : SPACE_URL_DEFAULT;
+      if (raw && url !== raw) warn(`空间地址不是 http(s)，已回落默认值：${SPACE_URL_DEFAULT}`);
+
+      log(`课程任务点已全部完成 → 跳转到个人空间：${url}`);
+
+      if (this.loopTimer) { Timers.clear(this.loopTimer); this.loopTimer = null; }
+
+      try {
+        location.href = url;
+      } catch (e) {
+        warn(`跳转个人空间失败（${(e && e.message) || e}），请手动打开：${url}`);
+      }
     },
 
     /* ------------------------------------------------------------
