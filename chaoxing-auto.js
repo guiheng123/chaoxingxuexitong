@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.7.0
+// @version      1.7.6
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -16,6 +16,8 @@
 // @grant        GM_registerMenuCommand
 // @connect      *
 // @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/guiheng123/chaoxingxuexitong/refs/heads/main/chaoxing-auto.js
+// @downloadURL  https://raw.githubusercontent.com/guiheng123/chaoxingxuexitong/refs/heads/main/chaoxing-auto.js
 // ==/UserScript==
 
 /*
@@ -70,6 +72,52 @@
  *    刻意**不要求**当前章节有完成标记 —— 目录末尾常常是"没有任务点的收尾小节"，
  *    超星不给它画勾，只认勾就会永远卡在那一节反复点「下一节」。
  *    三条缺一不可的理由见 NextModule.courseAllDone()。
+ *
+ *    【多视频任务点 —— v1.7.4 修的一类"逻辑紊乱"】
+ *
+ *    一个「视频」标签下可以挂**多个**视频任务点（真机 2.2.1 有 5 个、3.2.1 有 3 个、
+ *    5.2.1 有 4 个），页面上却往往只有 1~2 个标签。这类章节上曾有三处会翻车：
+ *
+ *      1) `isVideoTab()` 只认标签名里的"视频"二字。真机新版 `#prev_tab li` 的
+ *         `title` 是**空串**、文字只有一个序号（如 "1"），于是判据恒为假 →
+ *         `sequenceVideos()` 第一句就返回（顺序编排整条不跑）、
+ *         `contentReachedDone()` 第二句就放行（完成闸门整条失效）。
+ *         现在 `tabNameHasType()` 判断"名字里有没有类型信息"，只有名字**完全没信息**
+ *         时才回落到"看标签下有没有视频任务点容器"。名字说了别的类型（如"章节测验"）
+ *         时**不走回落**，所以不会把测验标签误判成视频。
+ *
+ *      2) 章节内换任务点调用的是 `click(li)`，而超星有些版本把处理器挂在内层元素上，
+ *         于是点了个空炮（日志里的 `⚠无 onclick/href`），页面没动、脚本却以为切成功，
+ *         永久停摆。现在和 goNext() 一样走 `clickTargetOf()`。
+ *
+ *      3) 超星切标签 / 重排 DOM 时会短暂重建 iframe，`playable` 可能从 N 个掉到 1 个。
+ *         旧代码在 `vs.length <= 1` 处清缓存并停止续期 → 15 秒后"等着"的那些被各自的
+ *         watchdog 全部推起来，顺序播放**静默失效**（日志里一个字都没有）。
+ *         现在这种"暂时看不见"会保住编排并续期，只在真的只剩 ≤1 个且没编排过时才清。
+ *
+ *    这一类的验证夹具是 bench/browser-verify-nvideo.html（N 个视频 + 子 frame 也注入
+ *    真脚本）与 bench/browser-verify-multivideo.html（2 个视频 + 交接/抖动相）。
+ *
+ *    【答题标签 —— v1.7.6 两次修正】
+ *
+ *    未开启 AI 答题（或答题 API 没配好）时，「章节测验」标签脚本处理不了。
+ *
+ *    第一层（v1.7.3 的 pendingTabsBefore 死锁）：它靠"挨个检查前面视频标签
+ *    做完没有"当刹车，但切换 #prev_tab 标签是**整卡重导航**（#iframe 从 num=0
+ *    换成 num=1），停在答题标签上时前面视频卡片根本不在 DOM 里，检查永远返回
+ *    "没做完"，整章永久卡死（真机 2.1.1 刷屏 4 分多钟）。修正：改信超星自己的
+ *    数据 —— jobUnfinishCount + 答题卡容器上的 ans-job-finished，据此判断
+ *    "本章除答题外还剩几个未完成"。
+ *
+ *    第二层（v1.7.6 二次修正的语义）：判据解决后，脚本一度把"答题做不了"
+ *    理解成"跳过它继续跑"，于是每章做完视频用 8 秒就把测验跳过、一路飞到
+ *    课程末尾（真机 2026-10-20 21:10-21:13 连跳三章，测验全军覆没，用户紧急
+ *    停止）。**正确语义：未开启答题时遇到答题任务点要停住等人工处理。**
+ *    只有一种例外 —— 本章除答题外还有没做完的任务点（它们必然排在答题标签
+ *    前面），先切回去补做，否则那个任务点会永久作废。
+ *
+ *    两件事都做对才是完整的：判据错 → 卡死；语义错 → 把测验全跳过。
+ *    详见 advanceTaskPoint 里答题段的说明。
  *
  * 5) 【性能与稳定性约束 —— 改代码前务必先读这段】
  *    这个脚本会同时跑在超星页面的**每一个** frame 里，而超星本身是重 DOM 的重应用，
@@ -284,6 +332,18 @@
 
     // ---- 答题 · 通用 ----
     autoSubmit: true,          // 填完自动点提交
+    /*
+     * v1.7.5 新增：考试页是否也自动交卷。默认 **false**，和 autoSubmit 分开。
+     *
+     * 为什么不能复用 autoSubmit 一个开关管所有页面：
+     * 作业/测验填错了顶多扣一次平时分；考试不一样 —— 分数权重高、往往限时、
+     * 有的老师只给一次机会，而 AI 答题本身就有答错的可能（模型幻觉、题库偏差）。
+     * 两者共用一个开关时，"作业想自动提交"就必然带着"考试也被直接交卷"，
+     * 这正是 v1.7.4 被用户报告的问题：视频和章节测验刷完，脚本把考试也直接交了。
+     * 默认拆开后：作业行为不变（老用户体验零变化），
+     * 考试只作答不交卷，想全自动的用户在面板勾上「考试自动交卷」即可。
+     */
+    examAutoSubmit: false,     // 考试页：填完后停在"已作答"状态，等用户检查后手动交卷
     submitDelay: 2000,         // 填完后等待毫秒再提交
     submitConfirm: false,      // 提交前是否弹确认（手动模式用）
     submitWaitMs: 20000,       // 提交后等待"提交成功"确认的最长时间
@@ -304,7 +364,7 @@
    * 升到 1.4.3 时就漏改了，用户拿到的日志会标错版本，排查时被误导。
    * bench/version-test.js 会强制校验这两处相等。
    */
-  const SCRIPT_VERSION = '1.7.0';
+  const SCRIPT_VERSION = '1.7.6';
   /*
    * v1.3.0 答题配置里的占位地址。
    * 它跟 v1.4.0 的默认值不同，所以在做"用户是否改过地址"的判断时必须显式排除，
@@ -866,6 +926,28 @@
     return CONFIG;
   }
 
+  /**
+   * 判断答题 API 是否真的配好了。
+   *
+   * 默认 apiUrl 指向 OpenAI，但默认没有密钥；这不算一份可用配置。
+   * 其它自定义端点仍允许无密钥（本地模型 / query 鉴权），不把合法的 keyless
+   * 服务误判成未配置。自定义模式则过滤默认占位地址和占位 token。
+   */
+  function hasAnswerApiConfig() {
+    if (CONFIG.apiMode === 'custom') {
+      const url = String(CONFIG.apiUrlCustom || '').trim().replace(/\/+$/, '');
+      const placeholder = String(DEFAULT_CONFIG.apiUrlCustom || '').trim().replace(/\/+$/, '');
+      if (!url || url === placeholder) return false;
+      return !/YOUR_(?:TOKEN|API_KEY|KEY)/i.test(String(CONFIG.apiHeaders || ''));
+    }
+
+    const url = String(CONFIG.apiUrl || '').trim().replace(/\/+$/, '');
+    if (!url) return false;
+    const key = String(CONFIG.apiKey || '').trim();
+    const defaultUrl = String(DEFAULT_CONFIG.apiUrl || '').trim().replace(/\/+$/, '');
+    return !!key || url !== defaultUrl;
+  }
+
   let onConfigChanged = null;
 
   /*
@@ -1024,7 +1106,14 @@
         else VideoModule.start();
         break;
       case 'top':
-        // 顶层壳：没有要重跑的模块，面板自己会刷新
+        /*
+         * 顶层壳：没有要重跑的模块，面板自己会刷新。
+         * 顺手清掉 NextModule 的"已确认做完的标签"记忆 —— 用户点「重新执行」
+         * 多半是怀疑判断错了；清空后，如果停在答题标签上且计数说还有没做完的
+         * 任务点，会再切回去重新核实一遍（见 firstOpenTabBefore）。
+         */
+        NextModule.doneTabsFor = null;
+        NextModule.doneTabIdx.clear();
         break;
       default:
         /*
@@ -1355,6 +1444,22 @@
      * 过期就当作没有标记，恢复"自己管自己"的默认行为。
      */
     SEQ_TTL_MS: 15000,
+    /*
+     * "保住编排不松手"（页面重排导致可见播放器暂时变少）最长能撑多久。
+     *
+     * 本来这是给"切标签时 iframe 短暂重建"留的缓冲，正常只有几秒。但超星会
+     * 预建隐藏的 video 元素，单靠可见性判断仍可能被持续卡住 —— 真机 5.1 现场
+     * 就出现过每 30 秒刷一次「只剩 1 个可见（共 3 个）」刷了两分多钟、视频在
+     * 播但脚本一步不推。超过这个时长就认定"它们不会回来了"，丢掉旧缓存重新
+     * 编排，保证最坏情况能自愈（宁可丢一次顺序，也不能永久停摆）。
+     */
+    SEQ_HOLD_MAX_MS: 45000,
+    /*
+     * 顶层每 3 秒才扫描一次任务点。子 frame 初次接管时先短暂等编排结果，
+     * 避免它们在顶层第一次写入 __cxSeq 之前各自起播或跳尾。
+     * 无编排标记到期后回退为原来的独立播放行为（单视频 / 顶层不可用）。
+     */
+    SEQ_STARTUP_GRACE_MS: 5000,
 
     /*
      * 判定"已有播放进度"的观察窗口。
@@ -1367,6 +1472,7 @@
     JUMP_PROBE_MS: 250,
     /* 硬上限：视频一直加载不出来（duration 永远读不到）时，探测不能永远跑下去 */
     JUMP_HARD_STOP_MS: 30000,
+    SEQ_WAIT_PROBE_MS: 1000,
 
     start() {
       if (!CONFIG.videoEnabled) return;
@@ -1385,6 +1491,7 @@
       this.jumped = false;
 
       this.video = v;
+      this.seqStartupUntil = Date.now() + this.SEQ_STARTUP_GRACE_MS;
       log('已接管视频:', v.duration ? v.duration.toFixed(1) + 's' : '未知时长');
 
       this.hardenPlayer();
@@ -1392,6 +1499,8 @@
       this.attachEvents();
       this.startWatchdog();
       this.startJumpProbe();
+      // 若顶层暂时没有写入顺序标记，启动宽限结束后恢复单视频自主播放。
+      Timers.after(() => this.play(), this.SEQ_STARTUP_GRACE_MS);
 
       /*
        * 这里曾经挂着一个 observe(document.documentElement, {subtree:true}) 的 MutationObserver，
@@ -1439,6 +1548,17 @@
       } catch (e) { return null; }
     },
 
+    /**
+     * 返回当前视频的顺序门状态：active / inactive / startup / open。
+     * 顶层尚未给出首轮决定时，startup 窗口先挡住自发播放；
+     * 到期后仍像旧版一样独立播放，避免顶层缺席时永久卡住。
+     */
+    sequenceGate(v) {
+      const sq = this.seqStateOf(v);
+      if (sq) return sq.active ? 'active' : 'inactive';
+      return Date.now() < (this.seqStartupUntil || 0) ? 'startup' : 'open';
+    },
+
     play() {
       const v = this.video;
       if (!v || this.mediaEnded) return;
@@ -1453,8 +1573,8 @@
        * 挨个加判断迟早会漏一个，而漏掉的那一个就会把"等着"的视频顶起来播，
        * 顺序编排当场失效。挡在这里是唯一的收口。
        */
-      const sq = this.seqStateOf(v);
-      if (sq && !sq.active) return;
+      const gate = this.sequenceGate(v);
+      if (gate === 'inactive' || gate === 'startup') return;
 
       if (!v.paused) return;
       const p = v.play();
@@ -1530,18 +1650,33 @@
      */
     startJumpProbe() {
       if (!CONFIG.videoJumpToEnd || this.jumpTried) return;
-      const hardStop = Date.now() + this.JUMP_HARD_STOP_MS;
+      let activeAt = 0;
       let deadline = 0;
 
       const probe = () => {
         if (this.jumpTried) return;
         const v = this.video;
+        if (!v || !v.isConnected) { this.jumpTried = true; return; }
+        const gate = this.sequenceGate(v);
+        if (gate === 'inactive') {
+          // 等待很久也不能耗尽新视频自己的跳尾观察窗口；轮到它后再开始计时。
+          Timers.after(probe, this.SEQ_WAIT_PROBE_MS);
+          return;
+        }
+        if (gate === 'startup') {
+          Timers.after(probe, this.JUMP_PROBE_MS);
+          return;                 // 等顶层首轮编排，观察窗口从放行后才开始
+        }
+
+        const now = Date.now();
+        if (!activeAt) activeAt = now;
+        const hardStop = activeAt + this.JUMP_HARD_STOP_MS;
         const ready = !!v && v.isConnected && isFinite(v.duration) && v.duration > 0;
-        if (ready && !deadline) deadline = Date.now() + this.JUMP_WINDOW_MS;
+        if (ready && !deadline) deadline = now + this.JUMP_WINDOW_MS;
 
         if (this.tryJumpToEnd()) return;
 
-        if (Date.now() < hardStop && (!deadline || Date.now() < deadline)) {
+        if (now < hardStop && (!deadline || now < deadline)) {
           Timers.after(probe, this.JUMP_PROBE_MS);
         } else {
           this.jumpTried = true;   // 窗口走完，判定为"从头播"，不再考虑
@@ -1560,6 +1695,8 @@
 
       const v = this.video;
       if (!v || !v.isConnected) return false;
+      const gate = this.sequenceGate(v);
+      if (gate === 'inactive' || gate === 'startup') return false;
       if (!isFinite(v.duration) || v.duration <= 0) return false;
 
       // 已经在末尾（或已结束）：没有可跳的，收工
@@ -5547,6 +5684,16 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     watching: false,      // 观察循环是否活着。**不要用 timer 判断**，见 watch() 的说明
     handled: new Set(),   // 已处理的题目签名，防止重复请求
     qTries: new Map(),    // 签名 → 已尝试次数（逐题模式用来给"重试"封顶）
+    /*
+     * 已经点过「开始考试 / 继续作答」这类入口按钮的元素（v1.7.5）。
+     *
+     * 用 WeakSet 而不是 Set：只需要"这个按钮我点过了"这一件事，
+     * 元素从 DOM 里移走后（点了入口后页面必然重渲染）不该再被引用 ——
+     * WeakSet 不会阻止 GC，Set 会把它钉在内存里直到本页关闭。
+     * 与 handled（按题目签名去重）同一设计动机：防的是"重复点击"，
+     * 但这里重复点击的后果更直接 —— 入口按钮点两下可能触发两次请求或两个计时。
+     */
+    enterClicked: new WeakSet(),
     timer: null,          // 下一次观察的定时器
     wait: 0,              // 下一次观察的间隔
     failStreak: 0,        // 连续"一个答案都没填上"的次数
@@ -5817,6 +5964,127 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     /*
+     * 本帧是不是"考试"（v1.7.5 新增）。
+     *
+     * detectRole() 只区分"是不是题目页"，不区分作业和考试 —— 两者都进 'work'，
+     * 于是考试页一直沿用为作业写的自动提交逻辑，这正是被用户报告的 bug 的根源：
+     * 视频和章节测验刷完后，脚本把考试也当成"普通作业"直接点了提交。
+     *
+     * 判定只认**正向证据**，方向上宁可误判成"是考试"（代价：多一次手动交卷），
+     * 也绝不误判成"不是"（代价：考试被自动交掉）：
+     *   1) 路径 /ananas/modules/exam/          —— 超星考试模块的标准路径（作业是 work/homework）
+     *   2) 路径 /exam/ 或 /exam-ans/           —— 与 detectRole() 的考试规则同源
+     *   3) URL 带 examId / examRelationId 参数 —— 考试页特有的任务标识（作业是 workId/jobid）
+     *   4) 提交按钮文字含「交卷」              —— 作业按钮写「提交」，考试的才写「交卷」；
+     *      按钮文案是页面自己渲染的，比类名可靠（.Btn_blue_1 这种通用蓝按钮两类页面都在用）
+     *
+     * 不做缓存：四条全是现读现算（两次正则 + 一次 findSubmit 扫描），
+     * 和 watch() 每 2~8 秒一次的节奏相比开销可忽略；缓存反而会在页面内部
+     * 从"入口页"切到"答题页"（同 frame、不重新导航）时给出过期结论。
+     */
+    examLike() {
+      const path = location.pathname;
+      if (/\/ananas\/modules\/exam\//i.test(path)) return true;
+      if (/\/exam(-ans)?\//i.test(path)) return true;
+      if (/[?&](examId|examRelationId)=/i.test(location.href)) return true;
+      try {
+        const btn = this.findSubmit();
+        return !!(btn && /交卷/.test(buttonText(btn)));
+      } catch (e) { return false; }
+    },
+
+    /*
+     * v1.7.5：点掉挡在题目前面的"入口"——「开始考试/继续答题」按钮、
+     * 以及「你有未提交的作答记录」恢复弹窗。
+     *
+     * 背景（就是 watch() 下面那段注释列的第 1、3 条场景，旧版只"看见"没处理）：
+     * 考试页先渲染入口按钮，点了才拉题目 → findContainers() 恒为 0 →
+     * 观察循环永远空转，用户看到的就是"考试页脚本一动不动"。
+     * 这一步补上：没题时主动把入口点开，题目渲染出来后自然落入原有的
+     * 抓题 → 调 AI → 回填 流程，满足"一旦检测到题目就直接作答"的诉求。
+     *
+     * 三道防误点保险（一层都不许省）：
+     *   1) 只在 findContainers() === 0 的分支被调用 —— 题目已渲染的卷子
+     *      绝不会走到这里，不存在"点入口把已答的卷子弄丢"的路径；
+     *   2) enterClicked WeakSet —— 同一个按钮只点一次；
+     *   3) breaker.allow —— 60 秒内最多 3 次，页面和脚本拉锯时熔断停手
+     *      （「开始考试」点击即开始计时、基本不可逆，绝不能进入高频重试）。
+     * 文案匹配排除「重新/重做」：重新作答、重新考试会把已有答案**清空重来**，
+     * 恰恰违反本脚本"绝不覆盖用户已有作答"的底线。
+     */
+    tryStartAnswering() {
+      const dlgBtn = this.findResumeDialogButton();
+      if (dlgBtn) {
+        if (!this.enterClicked.has(dlgBtn) && breaker.allow('继续作答', 3, 60000)) {
+          this.enterClicked.add(dlgBtn);
+          log(`检测到「你有未提交的作答记录」弹窗，点「${buttonText(dlgBtn)}」恢复之前的作答` +
+              '（不点「重新作答」—— 那会清空已答内容）。');
+          try { dlgBtn.click(); } catch (e) { warn('点击恢复作答按钮失败:', e.message || e); }
+        }
+        // 弹窗先处理：点完它页面才会继续往下渲染，入口按钮留给下一轮观察
+        return;
+      }
+      const btn = this.findEntryButton();
+      if (btn && !this.enterClicked.has(btn) && breaker.allow('开始考试', 3, 60000)) {
+        this.enterClicked.add(btn);
+        log(`当前没有题目，检测到入口按钮「${buttonText(btn)}」—— 点击进入。` +
+            '注意：考试通常从点击这一刻开始计时。');
+        try { btn.click(); } catch (e) { warn('点击入口按钮失败:', e.message || e); }
+      }
+    },
+
+    /** 找"开始考试/继续答题"这类入口按钮（只找可见的，见 findNextButton 里隐藏按钮的教训） */
+    findEntryButton() {
+      const texts = ['开始考试', '进入考试', '开始答题', '继续答题', '开始作答', '继续作答', '开始测验', '进入测验'];
+      let nodes = [];
+      try {
+        nodes = Array.from(document.querySelectorAll('a, button, div[class*="btn"], span[class*="btn"]'));
+      } catch (e) { return null; }
+      for (const n of nodes) {
+        const t = (n.textContent || '').trim();
+        if (!t || t.length > 12) continue;    // 长文案是正文/提示，不是按钮
+        if (/重新|重做/.test(t)) continue;      // 绝不点：会把已有作答清空重来
+        if (!texts.some((k) => t.includes(k))) continue;
+        if (!isVisible(n)) continue;             // 隐藏的入口点下去是另一条代码路径（见 findNextButton 的说明）
+        return n;
+      }
+      return null;
+    },
+
+    /**
+     * 「你有未提交的作答记录」弹窗里的「继续作答」按钮。
+     *
+     * 弹窗本体按"像弹层 + 正文提到未提交/作答记录"**双重条件**定位：
+     * 只看按钮文案（页面到处都是「继续」）会误伤别的弹窗，
+     * 只看弹层类名（layui-layer 满天飞）又会命中无关弹窗 ——
+     * 两个条件同时成立才进去找按钮，按钮文字要求是「继续作答/继续/确定」
+     * 且不含「重新/重做」。找不到就返回 null，让观察循环下一轮再看。
+     */
+    findResumeDialogButton() {
+      let popups = [];
+      try {
+        popups = Array.from(document.querySelectorAll(
+          '[class*="layer"],[class*="popup"],[class*="dialog"],[class*="modal"],[class*="confirm"]'
+        ));
+      } catch (e) { return null; }
+      for (const pop of popups) {
+        if (!isVisible(pop)) continue;
+        if (!/未提交|作答记录/.test(pop.textContent || '')) continue;
+        let btns = [];
+        try {
+          btns = Array.from(pop.querySelectorAll('a, button, div[class*="btn"], span[class*="btn"]'));
+        } catch (e) { continue; }
+        for (const b of btns) {
+          const t = (b.textContent || '').trim();
+          if (!t || t.length > 8) continue;
+          if (/重新|重做/.test(t)) continue;
+          if (/^(继续作答|继续|确定|确认)$/.test(t)) return b;
+        }
+      }
+      return null;
+    },
+
+    /*
      * 持续观察题目，而不是"等一次，等不到就算了"。
      *
      * v1.4.0 之前这里只等一次（waitFor 25 秒），超时就 log 一句永久返回，
@@ -5880,6 +6148,14 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
             const r = this.findContainers().length > 0 ? await this.loop() : 'idle';
             this.wait = watchDelay(this.wait, r);
           } else {
+            /*
+             * 一道题都没有：多半是题目还没渲染 —— 考试/测验的入口按钮没点、
+             * 恢复弹窗没关、或者接口还在拉数据。v1.7.5 起在这里主动清障
+             * （见 tryStartAnswering 的说明），点开后题目下一轮就会出现，
+             * 自然进入上面的 loop() 分支。题目已渲染的卷子永远走不到这里，
+             * 所以这个点击不会碰到任何已作答的内容。
+             */
+            this.tryStartAnswering();
             this.wait = watchDelay(this.wait, 'idle');
           }
         } catch (e) {
@@ -6100,6 +6376,27 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         }
 
         this.lastApi = `成功：回填 ${filled}/${total} 题`;
+
+        /*
+         * v1.7.5：考试闸门（第一道）—— 已全部答完 + 这是考试页 + 没勾「考试自动交卷」
+         * → 停在这里，不点提交。用户要的正是这个：脚本负责把题答好，
+         * 交不交、什么时候交，由人检查后自己决定（看一眼也就几秒钟）。
+         * 作业/测验不受影响，仍走下面的 autoSubmit 老逻辑。
+         *
+         * 注意**不 markDone**：任务点并没有完成，观察循环必须继续活着 ——
+         * 分页考试渲染出下一页题目时还得接着答（markDone 会挂起 30 秒，
+         * 那是"已交卷"的节奏，用在这里就变成"第二页永远没人答"）。
+         *
+         * 返回 'ok' 而不是 'idle'：'ok' 让下一轮观察 2 秒后就回来，
+         * 正对应"考试可能还有下一页题"；'idle' 会退避到 8 秒，
+         * 用户盯着页面会觉得脚本答完一页就睡着了。
+         */
+        if (this.examLike() && !CONFIG.examAutoSubmit) {
+          log(`已答完 ${filled}/${total} 题 —— 这是考试页，默认不自动交卷。` +
+              '请检查后手动点「交卷」；想全自动可在面板勾选「考试自动交卷」。');
+          this.lastApi = `成功：回填 ${filled}/${total} 题（考试页，等待手动交卷）`;
+          return 'ok';
+        }
 
         if (CONFIG.autoSubmit) {
           await sleep(CONFIG.submitDelay);
@@ -6778,6 +7075,19 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
      * 这是 v1.4.11 修掉的症状：答完题之后，提交停在确认框上，用户还得自己再点一下。
      */
     async submit() {
+      /*
+       * v1.7.5：考试闸门的第二道（防御性），放在 findSubmit 之前。
+       *
+       * 第一道在 loop() 里，但 submit() 的调用入口不止它一个 ——
+       * 「重新执行」或将来新增的代码路径都可能直调 submit()。
+       * 闸门必须长在 submit 自身的最顶部，任何入口进来都先过这一道，
+       * 否则"绕过 loop 直调 submit"就是考试被直接交卷的后门。
+       */
+      if (this.examLike() && !CONFIG.examAutoSubmit) {
+        warn('这是考试页且未勾选「考试自动交卷」—— submit() 拒绝点击「交卷」。' +
+             '答案已回填完成，请人工检查后手动交卷。');
+        return;
+      }
       const btn = this.findSubmit();
       if (!btn) return warn('未找到提交按钮，请手动提交');
       if (CONFIG.submitConfirm && !confirm('超星助手：确认提交本次作业？')) return log('已取消提交');
@@ -7479,6 +7789,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           </div>
 
           <div class="row"><span>自动提交</span><input type="checkbox" id="autoSubmit" ${c.autoSubmit ? 'checked' : ''}></div>
+          <!-- v1.7.5：考试交卷独立于 autoSubmit。默认不勾：考试直接被脚本交掉正是被报告的 bug，作业的自动提交行为则保持原样 -->
+          <div class="row"><span>考试自动交卷</span><input type="checkbox" id="examAutoSubmit" ${c.examAutoSubmit ? 'checked' : ''}></div>
           <div class="row"><span>提交前确认</span><input type="checkbox" id="submitConfirm" ${c.submitConfirm ? 'checked' : ''}></div>
           <div class="row"><span>兜底答案</span><input type="text" id="fallbackAnswer" value="${esc(c.fallbackAnswer)}" placeholder="留空=跳过"></div>
           <p class="tip">
@@ -7540,6 +7852,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       bindToggle('showProgress', 'showProgress');
       bindToggle('dryRun', 'dryRun');
       bindToggle('autoSubmit', 'autoSubmit');
+      // v1.7.5：考试交卷开关独立于 autoSubmit（考试被直接交卷是高风险动作，默认关；作业行为不变）
+      bindToggle('examAutoSubmit', 'examAutoSubmit');
       bindToggle('submitConfirm', 'submitConfirm');
       bindToggle('logEnabled', 'logEnabled');
       bindToggle('debug', 'debug');
@@ -7660,6 +7974,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         out.push(`── 弹窗诊断 ${new Date().toLocaleTimeString()} ──`);
         out.push(`地址: ${location.href.slice(0, 100)}`);
         out.push(`自动提交: ${CONFIG.autoSubmit ? '开' : '关（关了脚本不会自动点提交，弹窗要你自己点）'}`);
+        // v1.7.5：考试页的诊断行 —— "答完了却不交卷"是不是闸门拦的，看这一行就知道
+        out.push(`考试页: ${WorkModule.examLike() ? `是（examAutoSubmit=${CONFIG.examAutoSubmit ? '开' : '关'}，关=只作答不交卷）` : '否'}`);
         out.push(`提交按钮: ${WorkModule.findSubmit() ? '已找到' : '**未找到**'}`);
         out.push(`弹窗确定按钮: ${WorkModule.findDialogConfirm() ? '已找到（会点它）' : '**没找到** ← 弹窗点不掉就是这个原因'}`);
         out.push(`整页兜底: ${WorkModule.findAnyConfirmButton() ? '能找到' : '找不到'}`);
@@ -7698,6 +8014,9 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           '',
           `答题开关: ${CONFIG.answerEnabled ? '开' : '关（开了才会观察题目）'}`,
           `自动提交: ${CONFIG.autoSubmit ? '开' : '关（关了脚本不会自动点提交）'}`,
+          // v1.7.5：考试页判定。注意这是"本 frame"的判定 —— 题目在子 frame 里时
+          // 顶层报"否"是正常的，看下面各 frame 的上报那一段
+          `考试页: ${WorkModule.examLike() ? `是（examAutoSubmit=${CONFIG.examAutoSubmit ? '开' : '关'}，关=答完不交卷，等手动）` : '否'}`,
           `提交弹窗: ${WorkModule.findDialogConfirm() ? '检测到确定按钮（会点）' : '未检测到（弹窗出现时点「弹窗诊断」）'}`,
           `作答方式: ${CONFIG.answerMode === 'batch' ? '整卷一次' : `逐题作答（失败重试 ${Number(CONFIG.answerRetries) || 0} 次）`}`,
           `题旁进度: ${CONFIG.showProgress ? '开' : '关'}`,
@@ -8080,8 +8399,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     holdKey: '',        // 上次记过的"不推进原因"（同一个原因只打一次日志）
     seqVideos: null,    // 上次顺序编排时的视频列表（判断"编排结果变没变"）
     seqActiveIdx: -1,   // 上次顺序编排选中的下标（-1 = 全部已到完成线）
+    seqHoldLoggedAt: 0, // 上次记"播放器暂时变少、保住编排"日志的时间（节流用）
+    seqHoldSince: 0,    // "保住编排不松手"从什么时候开始连续成立的（超过 SEQ_HOLD_MAX_MS 就放弃缓存）
     finishStrikes: 0,   // "整门课都做完了"连续成立了几轮（见 courseAllDone）
     spaceJumped: false, // 已经跳去个人空间了（一次性，防止跳转落地前又跑一轮）
+    doneTabIdx: new Set(), // 本页已确认做完的任务点标签（下标）——切回未完成标签时不重复选它们（见 firstOpenTabBefore）
+    doneTabsFor: null,     // 上面那份记忆属于哪个章节（目录项元素）；换章即清空
 
     /*
      * 「超星标记迟到」的宽限时长。
@@ -8437,16 +8760,106 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (count == null || count <= 0) return;   // 读不到计数 / 整章已完成 → 交给 goNext
 
       const tabs = this.taskTabs();
-      if (tabs.length <= 1) return;              // 只有一个任务点，没有"下一个"可切
-
       const curIdx = this.activeTaskIndex(tabs);
       if (curIdx < 0) return;                    // 认不出当前标签，宁可不动
-      if (curIdx >= tabs.length - 1) return;     // 已经是最后一个，后面没有可切的
 
+      /*
+       * 换章了：清空"已确认做完的标签"记忆（doneTabIdx）。记忆里存的是**下标**，
+       * 只对当前这一章的 tabs 数组有意义 —— 不清的话，上一章的下标会把这一章
+       * 同位置的标签误标成"已做完"，需要切回没做完的任务点时会跳过该做的。
+       */
+      if (item && item !== this.doneTabsFor) {
+        this.doneTabsFor = item;
+        this.doneTabIdx.clear();
+        /*
+         * 顺序播放缓存也一并清掉：它记的是**上一章那些 video 元素**。
+         * 同一个页面里换章（超星有整页跳转和小节内切换两种）时，留着旧缓存
+         * 会让 sequenceVideos() 误判"播放器少了，正在重建"，于是死等它们挂回
+         * 来 —— 单视频章节会被这个假象永久拖住（真机 5.1 现场）。
+         */
+        this.seqVideos = null;
+        this.seqActiveIdx = -1;
+        this.seqHoldSince = 0;
+      }
+
+      /*
+       * ============================================================
+       * 答题类标签（测验 / 作业）的处理 —— ★ v1.7.6 第二次修正
+       * ============================================================
+       *
+       * 用户明确要求：**未开启 AI 答题时，遇到答题任务点要停住等人处理，
+       * 不能跳过。** 之前一版把"答题做不了"理解成"别让它卡住脚本"，于是
+       * 每章做完视频就自动跳过测验、8 秒一节地往前飞 —— 真机日志 2026-10-20
+       * 21:10-21:13 连跳三章，测验全军覆没（用户当场紧急停止）。
+       *
+       * 现在只有两条路：
+       *   ① 本章还有**非答题**任务点没做完（它们必然排在当前标签前面 ——
+       *      答题标签一般压轴，且脚本只往前走）→ 先切回去把它做完。
+       *      否则那个视频任务点会因为测验挡路而永远作废。
+       *   ② 其余都做完了，只剩答题任务点 → **原地停住**，记一条日志等人
+       *      手动答题 / 打开答题开关。绝不 goNext、绝不跳到下一个标签。
+       *
+       * 判据只信超星自己的数据：
+       *   · jobUnfinishCount —— 目录项里的隐藏 input，本章未完成任务点数
+       *     （服务器权威，任务点完成后会实时刷新）。
+       *   · 当前答题卡片容器上的 ans-job-finished —— 测验提交后超星会画上
+       *     （真机实测 2026-10-19：已提交的 1.1.2 测验卡 =
+       *     "ans-attach-ct ans-job-finished"；未提交的 2.1.1 = "ans-attach-ct"）。
+       *   据此算出"除这张答题卡外还剩几个未完成"：count - quizOwn。
+       *
+       * ⚠️ 为什么不能用 v1.7.3 的 pendingTabsBefore() 去逐个检查前面视频
+       * 标签做完没有：切换 #prev_tab 标签是**整卡重导航**（#iframe 从 num=0
+       * 换成 num=1），停在答题标签上时前面视频的卡片整个不在 DOM 里，那个
+       * 检查永远返回"没做完"，会把整章永久卡死（真机 2.1.1 卡了 4 分钟）。
+       * 所以必须用计数推算，不能去读不存在的 DOM。
+       */
+      if ((!CONFIG.answerEnabled || !hasAnswerApiConfig()) && this.isAnswerTab(tabs[curIdx])) {
+        const quizDone = this.currentCardJobFinished();
+        const quizOwn = quizDone ? 0 : 1;   // 答题卡未提交时，至少占掉 count 里 1 个
+        const otherUnfinished = count - quizOwn;
+
+        /*
+         * ① 本章除答题外还有没做完的任务点：先切回去做（不做就永久作废）。
+         *    切回目标不带答题类标签，且用 doneTabIdx 防止来回打转。
+         *    这里**不看冷却**：切回是正确的补偿动作，晚 3 秒做没有意义，
+         *    但为了避免和正常的 8 秒节奏打架，仍然走同一个冷却门。
+         */
+        if (otherUnfinished > 0) {
+          if (Date.now() - this.lastTabSwitchAt < this.TAB_SWITCH_COOLDOWN) return;
+          const back = this.firstOpenTabBefore(tabs, curIdx);
+          if (back >= 0) {
+            this.lastTabSwitchAt = Date.now();
+            this.holdKey = '';
+            log(`答题未启用/未配置，本章还有 ${otherUnfinished} 个任务点未完成，` +
+                `先切回第 ${back + 1} 个标签「${this.tabLabel(tabs[back])}」把它做完`);
+            this.click(this.clickTargetOf(tabs[back]) || tabs[back]);
+            return;
+          }
+          /* 前面认不出可补做的标签 —— 与 ② 同路：停住，不冒进。 */
+        }
+
+        /*
+         * ② 只剩答题任务点（或前面已无可补做项）→ 停住等人工处理。
+         *    noteHold 用固定 key，3 秒一轮的轮询不会刷屏；进度一旦变化
+         *   （用户交了测验 / 打开答题开关），这个分支自然不再进入。
+         */
+        this.noteHold('answer-disabled',
+          `答题未启用/未配置：已停在答题任务点「${this.tabLabel(tabs[curIdx])}」等待处理` +
+          `（本章还剩 ${count} 个任务点未完成）。` +
+          `请手动完成测验，或在面板「答题」里启用 AI 答题后脚本会自动继续`);
+        return;
+      }
+
+      if (curIdx >= tabs.length - 1) return;     // 已经是最后一个，后面没有可切的
       if (!this.taskDone(count, tabs, curIdx)) return;
       if (Date.now() - this.lastTabSwitchAt < this.TAB_SWITCH_COOLDOWN) return;
 
       this.lastTabSwitchAt = Date.now();
+      /*
+       * 记一笔"这个标签本页已确认做完"：之后若停在后面的答题标签上、需要切回
+       * 没做完的任务点（firstOpenTabBefore），它不会再被选中 —— 防打转的关键。
+       */
+      this.doneTabIdx.add(curIdx);
       const next = tabs[curIdx + 1];
       /*
        * 措辞分清楚「标签数」和「任务点数」—— 它们不总是相等（真机 6.1：2 个标签
@@ -8455,7 +8868,88 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
        */
       log(`当前任务点已完成（本章 ${tabs.length} 个标签，还剩 ${count} 个任务点未完成），` +
           `切到下一个: ${this.tabLabel(next)}`);
-      this.click(next);
+      /*
+       * ★ v1.7.4：走 clickTargetOf()，跟 goNext() 对齐。
+       *
+       * 原来这里直接 click(next) —— next 是 #prev_tab 的 <li> 容器。
+       * 真机当前版本那个 li 恰好自带 onclick（changeDisplayContent(...)），
+       * 所以侥幸能用；但历史上（以及测试夹具里）处理器是挂在**内层**元素上的，
+       * 这时 click(li) 就是空炮：日志写「已点击 <li> ⚠无 onclick/href」，
+       * 页面纹丝不动，而脚本认为切成功了 → 永久停摆。
+       *
+       * 多视频任务点尤其容易踩：任务点多、切换次数多，每一轮都要换任务点。
+       * clickTargetOf() 先看自己有没有 onclick/href，再往下找真正带处理器的后代，
+       * 找不到才退回容器 —— 两种形状都能点对。
+       */
+      this.click(this.clickTargetOf(next) || next);
+    },
+
+    /**
+     * 当前标签**之前**，第一个"还没确认做完、且不是答题类"的标签（0 基下标；没有返回 -1）。
+     *
+     * 用途见 advanceTaskPoint 里"答题标签是本章最后一个"的分支：答题做不了、
+     * 本章还有别的任务点没做完时，切回它让对应模块去干活（视频会播、文档会翻页）。
+     * 停在答题标签上等是等不来任何进展的 —— 各模块只处理**当前挂载**的卡片。
+     *
+     * "还没确认做完" = 不在本页的 doneTabIdx 记忆里。这份记忆只在**正常推进**
+     * （taskDone 通过、切往下一个标签）时记录，作用是防打转：多答题标签的
+     * 章节里，从视频推进到测验、又被切回时，已确认做完的视频不会被重复选中，
+     * "视频→测验→回视频→…"的循环走不起来。
+     *
+     * 答题类标签不是切回目标 —— 它们和当前这个一样做不了；能让脚本推进的
+     * 只有非答题标签。跨章不适用（advanceTaskPoint 开头随章节变化清空记忆）。
+     *
+     * @param  {Array}  tabs   任务点标签列表
+     * @param  {number} curIdx 当前标签下标
+     * @returns {number}       可切回的标签下标；没有返回 -1
+     */
+    firstOpenTabBefore(tabs, curIdx) {
+      for (let i = 0; i < curIdx; i++) {
+        if (this.isAnswerTab(tabs[i])) continue;   // 答题类：本分支的前提就是"做不了"
+        if (this.doneTabIdx.has(i)) continue;      // 本页已确认做完的，不再重复去
+        return i;
+      }
+      return -1;
+    },
+
+    /**
+     * 当前挂载的卡片里，**所有**任务点容器（div.ans-attach-ct）是否都画上了
+     * ans-job-finished。
+     *
+     * 只在"当前标签是答题类"时被调用 —— 那时挂载的就是答题卡，容器就是测验
+     * 任务点自己。测验提交后超星会在容器上画 ans-job-finished（真机实测
+     * 2026-10-19：已提交的 1.1.2 测验卡 class="ans-attach-ct ans-job-finished"，
+     * 未提交的 2.1.1 = "ans-attach-ct"）—— 这是"这张答题卡做完没有"唯一可靠的
+     * 现场证据，也是把 count 里属于答题自己的那部分扣掉（quizOwn）的依据。
+     *
+     * 走法和 videoTaskBoxes() 同一套（顶层 → 同源 iframe 逐层下钻）；跨域支路
+     * 自然跳过。返回三档：
+     *   true   所有容器都带标记 → 这张卡做完了
+     *   false  有容器不带 → 没做完
+     *   null   一个容器都找不到（改版 / 全跨域）→ "不知道"，调用方按
+     *          "未提交"的保守方向处理（quizOwn 记 1，宁多等不少跳）
+     */
+    currentCardJobFinished() {
+      let total = 0;
+      let finished = 0;
+      const walk = (w) => {
+        let d;
+        try { d = w.document; } catch (e) { return; }   // 跨域
+        if (!d) return;
+        let boxes = [];
+        try { boxes = Array.from(d.querySelectorAll('div.ans-attach-ct')); } catch (e) { boxes = []; }
+        for (const box of boxes) {
+          total++;
+          try { if (box.classList.contains('ans-job-finished')) finished++; } catch (e) { /* 类名读不了按未完成 */ }
+        }
+        let fs = [];
+        try { fs = Array.from(d.querySelectorAll('iframe')); } catch (e) { fs = []; }
+        for (const f of fs) {
+          try { if (f.contentWindow && f.contentWindow.document) walk(f.contentWindow); } catch (e) { /* 跨域子 frame，跳过 */ }
+        }
+      };
+      walk((document && document.defaultView) || window);
+      return total ? total === finished : null;
     },
 
     /**
@@ -8939,10 +9433,98 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       const vs = playable.map((t) => t.video);
       if (vs.length <= 1) {
         /*
-         * 0 个 / 1 个视频：没有"次序"可言。
+         * 0 个 / 1 个"有播放器"的任务点：通常没有"次序"可言。
          * 清掉缓存，让"切到这个标签"这件事被重新识别一次 —— 否则从多视频标签
          * 切到单视频标签时，缓存还留着上一个标签的形状，可能把不该动的视频动了。
+         *
+         * ★ v1.7.4：但这**不总是**真的"只剩一个"。超星切标签 / 重排 DOM 时会
+         * 短暂重建 iframe，于是 playable 从 N 个掉到 1 个 —— 此时若照旧清缓存
+         * 走人，就不再续期任何标记；15 秒保质期（SEQ_TTL_MS）一过，那些
+         * "等着"的视频被各自的 watchdog 当成"没有编排、我该自己播"全部推起来，
+         * 顺序播放当场失效，而且**日志里一个字都没有**（"已到完成线 / 让它播"
+         * 那句只在结果变化时才打）。多视频任务点越多，撞上的概率越大。
+         *
+         * 所以这里分两种情况：
+         *   · 上一轮**确实编排过多视频**，且我手里还记着那些 video 元素
+         *     → 当成"暂时看不见"，**保住缓存 + 续期标记**，别松手。
+         *   · 否则（首轮、或真的是单视频标签）→ 按原来的清缓存处理。
          */
+        /*
+         * ★ v1.7.6 第三次修正（真机 2026-10-20 20:12-20:18 实测）：
+         *
+         * 用户报"单视频章节脚本停在原地不播、只有多视频任务点才播"。真机现场
+         * （5.1 专题八，目录徽标 2 = 视频+测验、标签下**只有 1 个**可见播放器）
+         * 日志每 30 秒刷一次：
+         *     「顺序播放：本标签下的播放器暂时只剩 1 个可见（共 3 个），
+         *       先保住编排不松手，等它们挂回来」
+         * 视频其实在正常播（5:35/17:44），脚本却永远不推进。
+         *
+         * 原因：超星在标签下预建了 3 个 video 元素，只有 1 个真的可见，另外 2 个
+         * 是隐藏的（旧的/预加载的）。v1.7.4 的存活判据只看 isConnected ——
+         * 隐藏元素也是 connected 的 —— 于是 alive 一直 >= 2，canHold 永久成立，
+         * 脚本永远"保住编排不松手"，既不推进也永远等不到"它们挂回来"。
+         *
+         * 两处修正：
+         *   1) 存活判据加上"真的可见"：隐藏的播放器不算活，不该拖住编排。
+         *   2) 再加一道时长兜底：hold 连续超过 SEQ_HOLD_MAX_MS 就强制放弃缓存
+         *      重来。动画中的元素 visibility 可能短暂抖动，单靠可见性仍可能被
+         *      卡住，兜底保证最坏情况也能自愈。
+         */
+        const prev = this.seqVideos;
+        const canHold = !!(prev && prev.length > 1);
+        if (canHold) {
+          const holdFor = Date.now() - (this.seqHoldSince || 0);
+          /*
+           * ⚠️ 常量在 VideoModule 上（和 SEQ_TTL_MS 放一起），这里必须写全名 ——
+           * 写成 this.SEQ_HOLD_MAX_MS 是 undefined，比较恒为 false，兜底会静默失效。
+           */
+          if (this.seqHoldSince && holdFor > VideoModule.SEQ_HOLD_MAX_MS) {
+            log(`顺序播放：保住编排已超过 ${Math.round(holdFor / 1000)} 秒仍未挂回，放弃旧缓存重新编排`);
+            this.seqHoldSince = 0;
+            this.seqVideos = null;
+            this.seqActiveIdx = -1;
+            return -1;
+          }
+          /*
+           * 续期仍然连着文档、且**真的可见**的那些旧元素 —— 元素被 iframe 重建
+           * 带走的那些 refreshSeqStamps() 会自然跳过（它逐个检查 isConnected）。
+           *
+           * ★ 为什么要加 isVisible：超星会在标签下预建多个 video 元素，只有
+           * 当前那个是显示的，其余是隐藏的。隐藏元素 isConnected 恒为 true，
+           * 只按 connectivity 判断会让"还剩 1 个可见、共 3 个"这种状态永远成立，
+           * 编排就此锁死（真机 5.1 现场，20:17 日志每 30 秒刷一次）。
+           */
+          const alive = prev.filter((v) => {
+            try {
+              if (!v || !v.isConnected) return false;
+              if (isVisible(v)) return true;
+              /*
+               * 兜一层：有些播放器用 opacity/裁剪藏起来，checkVisibility 可能返回
+               * false，但它确实还在工作（正在播、或带着非零尺寸）。这种也算活，
+               * 否则会把真正在播的那个一起过滤掉。
+               */
+              if (v.readyState > 2 && !v.paused) return true;
+              const r = v.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            } catch (e) { return false; }
+          });
+          if (alive.length > 1) {
+            if (!this.seqHoldSince) this.seqHoldSince = Date.now();
+            this.refreshSeqStamps(prev);
+            /*
+             * 只在"从多掉到少"那一刻记一次，别每 3 秒刷屏 ——
+             * 但必须留下痕迹，否则这类静默失效永远查不出来。
+             * 用独立的时间戳节流（不能用 holdKey：它会被别的分支反复清空）。
+             */
+            const now = Date.now();
+            if (now - (this.seqHoldLoggedAt || 0) > 30000) {
+              this.seqHoldLoggedAt = now;
+              log(`顺序播放：本标签下的播放器暂时只剩 ${vs.length} 个可见（共 ${prev.length} 个），` +
+                  `先保住编排不松手，等它们挂回来`);
+            }
+            return this.seqActiveIdx;
+          }
+        }
         this.seqVideos = null;
         this.seqActiveIdx = -1;
         return -1;
@@ -8966,10 +9548,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           this.seqActiveIdx === k &&
           this.seqVideos.every((x, i) => x === vs[i])) {
         this.refreshSeqStamps(vs);
+        this.seqHoldSince = 0;   // 编排恢复正常，hold 计时归零
         return k;
       }
       this.seqVideos = vs.slice();
       this.seqActiveIdx = k;
+      this.seqHoldSince = 0;     // 同上：一旦真正选出该播的那个，就不算 hold 中
 
       if (k < 0) {
         log(`本标签下 ${vs.length} 个视频任务点都已到完成线 ✓`);
@@ -9040,7 +9624,22 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
       try {
         if (st.active) {
-          if (v.paused && !v.ended) {
+          /*
+           * ★ v1.7.4：已经做完的任务点不重播。
+           *
+           * 顶层这一支是**绕过** VideoModule 的（直接对元素 play()），所以它
+           * 看不到子模块那个 `mediaEnded` 闩锁。多视频时编排每 3 秒重算一次，
+           * 只要某个已完成视频的完成状态抖一下（标记迟到 / 容器重建），
+           * 它就会被重新标成 active → 在这里被**重播**一遍：白耗流量，
+           * 还会和"顶层正在切标签"抢播放器。
+           *
+           * 判据用超星自己画的完成标记（容器上的 ans-job-finished），
+           * 和 videoTaskDone() 同源；再加 ended 兜一层。
+           */
+          const box = this.boxOfVideo(v);
+          const alreadyDone = !!(box && box.classList &&
+                                 box.classList.contains('ans-job-finished'));
+          if (!alreadyDone && v.paused && !v.ended) {
             const p = v.play();
             if (p && p.catch) p.catch(() => {});
           }
@@ -9051,6 +9650,33 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         /* 播放器可能用自定义控件接管了，操作失败不影响标记本身 */
       }
       return stamped;
+    },
+
+    /**
+     * 反查一个 video 属于哪个任务点容器（往上走到 div.ans-attach-ct）。
+     *
+     * 视频在容器内部那个 iframe 里 —— 同源时能顺着 frameElement 往上走。
+     * 跨域 / 走不上去时返回 null（调用方按"不知道"处理，不因此改变行为）。
+     */
+    boxOfVideo(v) {
+      try {
+        let w = v && v.ownerDocument && v.ownerDocument.defaultView;
+        for (let d = 0; d < 6 && w; d++) {
+          const fe = w.frameElement;
+          if (!fe) return null;
+          if (fe.classList && fe.classList.contains('ans-attach-ct')) return fe;
+          /*
+           * 有些结构里容器是 frameElement 的祖先（iframe 外还包了一层）。
+           * 往上爬一小段，够到就返回。
+           */
+          let p = fe.parentElement;
+          for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+            if (p.classList && p.classList.contains('ans-attach-ct')) return p;
+          }
+          w = fe.ownerDocument && fe.ownerDocument.defaultView;
+        }
+      } catch (e) { /* 跨域 → 不知道 */ }
+      return null;
     },
 
     /**
@@ -9177,14 +9803,79 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     /**
+     * 这个标签名字里**有没有携带类型信息**（"视频" / "测验" / "作业" …）。
+     *
+     * ★ v1.7.4 新增。为什么需要它：
+     *
+     * 真机（思想道德与法治，courseid=267347217）上多视频章节 2.2.1
+     * （目录标注未完成 **5** 个任务点）的 `#prev_tab` 长这样：
+     *
+     *     <li class="active" title=""  id="dct1"
+     *         onclick="changeDisplayContent(1,1,'1250858287',…);">
+     *       <div class="prev_white"><span class="num">1</span></div>
+     *     </li>
+     *
+     * —— `title` 是**空串**，标签文字只有一个数字 "1"。
+     * 旧版页面这里写的是 `title="视频"`，而新版把它换成了纯序号 + 图标。
+     *
+     * 于是 `tabName()` 得到 "1"，`/视频/.test("1")` 为假 →
+     *   · sequenceVideos() 第一句就 return -1，**多视频顺序编排整条不跑**；
+     *   · contentReachedDone() 第二句就 return true，**完成闸门整条失效**。
+     * 这正是用户报的"多个视频任务点时逻辑紊乱"。
+     *
+     * 判据：名字里既没有"视频"也没有任何答题类关键词，且剥掉数字/空白/标点后
+     * 什么都不剩 —— 就认为这个名字不含类型信息，需要回落到内容判据。
+     *
+     * 刻意写得**窄**：只要还剩得下任何一个汉字/字母，就认为名字有效、
+     * 绝不改判 —— 免得把"文档"这种名字误当成"没有信息"。
+     */
+    tabNameHasType(tab) {
+      const n = this.tabName(tab);
+      if (!n) return false;
+      if (/视频/.test(n)) return true;
+      if (this.isAnswerTab(tab)) return true;
+      // 剥掉数字、空白与常见排版字符后还有没有东西
+      const rest = n.replace(/[\s\d\p{P}\p{S}]/gu, '');
+      return rest.length > 0;
+    },
+
+    /**
      * 这个任务点标签是不是视频类。
      *
-     * 用**名字**判断，而不是"内容里有没有 video" —— 后者分不清
-     * "本来就不是视频"和"是视频但播放器还没挂上"，而那正是 v1.5.5
-     * 把视频标签误切走的原因。
+     * 主判据仍然是**名字**（"视频"），而不是"内容里有没有 video" ——
+     * 后者分不清"本来就不是视频"和"是视频但播放器还没挂上"，
+     * 而那正是 v1.5.5 把视频标签误切走的原因。
+     *
+     * ★ v1.7.4 补一道**窄口径**的回落，见 tabNameHasType()：
+     * 只有当标签名**完全没有携带类型信息**（真机新版：title 空、文字只有一个序号）
+     * 时，才退一步去看"这个标签下的内容里有没有视频任务点"。
+     *
+     * 为什么这道回落是安全且必要的：
+     *   · 必要性：不做回落，上面那个多视频章节的判据恒为假 →
+     *     顺序编排不跑、完成闸门失效，脚本在"几个视频一起停着"的状态下干等。
+     *   · 安全性：`videoTaskBoxes()` 认的是超星真的视频任务点容器
+     *     （div.ans-attach-ct + videoContainer / video / video 图标 / video 模块 iframe，
+     *     见 isVideoTaskBox）。名字已经明说"不是视频"（如"章节测验"）时**根本不走这里**，
+     *     所以不存在"把测验标签误判成视频"的风险。
+     *   · 代价可控：回落为假时行为等于旧版（退回位置判据），不会更糟。
      */
     isVideoTab(tab) {
-      return /视频/.test(this.tabName(tab));
+      if (/视频/.test(this.tabName(tab))) return true;
+      if (this.tabNameHasType(tab)) return false;   // 名字说了别的类型 → 尊重它
+      /*
+       * 名字不含类型信息 → 看内容。只认"超星自己画出来的视频任务点容器"，
+       * 不认裸 <video>：后者会把"播放器还没挂上"和"根本不是视频"混为一谈。
+       */
+      try {
+        return this.videoTaskBoxes().length > 0;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    /** 当前标签是不是需要外部答题接口的测验 / 作业类任务点 */
+    isAnswerTab(tab) {
+      return /作业|测验|考试|答题|习题|quiz|exam|homework|assignment|test/i.test(this.tabName(tab));
     },
 
     /** 任务点标签的短名字（日志 / 诊断用） */
