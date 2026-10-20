@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.7.8
+// @version      1.7.9
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -157,6 +157,12 @@
  *    另：未确认的「点过提交」记录不再直接当成任务点已完成（见 doneReason）—— 点提交 ≠
  *    交卷成功，旧逻辑会让用户在提交失败后永远等不到脚本继续作答。
  *
+ *    【v1.7.9：章节测验被误判成整卷外壳】
+ *    doHomeWorkNew 章节测验里，**一道题**同时有 `.newZy_TItle`（题型标签）和 `.Zy_TItle`（题干），
+ *    v1.7.8 初版的 looksLikeWrapper 用「题干元素 > 1」判定整卷外壳，于是每一道正常题都被跳过，
+ *    日志刷「题目容器 TiMu newTiMu 里包含多道题/过多选项」。现在只认两个强证据：
+ *    容器里包住 ≥2 道完整题目，或选项数 > 30。正常题（哪怕有两个题干类名）不再被误伤。
+ *
  * 5) 【性能与稳定性约束 —— 改代码前务必先读这段】
  *    这个脚本会同时跑在超星页面的**每一个** frame 里，而超星本身是重 DOM 的重应用，
  *    所以任何"每次 DOM 变更都执行"或"和页面无限拉锯"的逻辑，都会被放大成卡顿甚至内存溢出。
@@ -308,7 +314,7 @@
   const LOG_KEY = 'cx_auto_logbuf';
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改，
    * 用户日志标错版本、排查被误导。bench/version-test.js 强制校验两处相等。 */
-  const SCRIPT_VERSION = '1.7.8';
+  const SCRIPT_VERSION = '1.7.9';
   /* v1.3.0 答题配置里的占位地址，跟 v1.4.0 的默认值不同，所以判断"用户是否改过地址"时必须显式排除，
    * 否则从没配过答题的老用户会被误判成"自定义接口用户"（bench/config-migration-test.js 冲着这个坑写的）。 */
   const LEGACY_PLACEHOLDER_URL = 'https://your-api.example.com/answer';
@@ -2120,9 +2126,6 @@
 
   /** 弹层里的按钮元素，合并成一个选择器 */
   const DIALOG_BTN_ANY = Q_SELECTORS.dialogBtn.join(',');
-
-  /** 数"一道题里有几个题干"用的选择器。刻意**不含** `.TiMu .clearfix`（那是选项行），否则每道题都会被数出 4 个题干。 */
-  const STEM_COUNT_SEL = '.mark_name, .Zy_TItle, .qtContent, .newZy_TItle, .TiMuTitle';
 
   /** 选项选中态：隐藏 answer 输入框之外的兜底判据（不同超星版本用 cur / selected / on 等） */
   const OPTION_CHECKED_SEL = '.cur, .selected, .checked, .choose, .choosed, [aria-checked="true"]';
@@ -6019,14 +6022,28 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     /**
      * 一个候选容器是不是"包住整卷的外壳"。
-     * 判据：一道题里不可能有多个题干，也不可能同时出现几十个选项。
-     * 这是交卷闸门的最后一道保险 —— 哪怕 findContainers 又选错了，这里也能把外壳认出来。
+     * 判据（只认强证据，宁可不拦也不能误伤真题目）：
+     *  1) 容器里还包着 ≥2 道"完整题目" —— 整卷外壳最可靠的特征
+     *     （.TiMu 外壳包住 80 个 .questionLi）；
+     *  2) 选项多到不可能是一道题（80 题整卷 ≈ 280 个选项）。
+     *
+     * ⚠ 不要用"题干元素多于 1 个"来判：真机章节测验（doHomeWorkNew）一道题同时有
+     *   `.newZy_TItle`（题型标签）和 `.Zy_TItle`（题干），两个都命中题干选择器，
+     *   v1.7.8 初版就是这么把**每一道正常题**都当成整卷外壳跳过的。
      */
     looksLikeWrapper(el) {
       if (!el) return false;
-      try {
-        if (el.querySelectorAll(STEM_COUNT_SEL).length > 1) return true;
-      } catch (e) { /* 忽略 */ }
+
+      let inner = [];
+      try { inner = Array.from(el.querySelectorAll(Q_SELECTORS.container.join(','))); } catch (e) { inner = []; }
+      let nested = 0;
+      for (const n of inner) {
+        if (n === el) continue;
+        let ok = false;
+        try { ok = this.looksLikeQuestion(n); } catch (e) { ok = false; }
+        if (ok && ++nested >= 2) return true;
+      }
+
       try {
         if (this.pickAll(el, Q_SELECTORS.option).length > 30) return true;
       } catch (e) { /* 忽略 */ }
