@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.7.7
+// @version      1.7.8
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -133,6 +133,29 @@
  *
  *    两件事都做对才是完整的：判据错 → 卡死；语义错 → 把测验全跳过。
  *    详见 advanceTaskPoint 里答题段的说明。
+ *
+ *    【题目识别与交卷闸门 —— v1.7.8 修的严重问题】
+ *
+ *    真机作业页（mooc-ans/mooc2/work/dowork，80 题）的 DOM 是：
+ *        <div class="TiMu">                    ← 整卷外壳，1 个，里面 280 个选项
+ *          <div class="questionLi" ...>…</div> × 80
+ *        </div>
+ *    findContainers() 旧实现是「第一个命中的选择器直接返回」：.TiMu 先命中 → 整卷被当成
+ *    1 道题（280 个选项）。于是模型只被问到 1 道、只回填 1 个选项，而 total 也是 1，
+ *    filled === total 成立 → 脚本立刻点「提交/交卷」。作业被只答一题就交、考试被直接交卷、
+ *    有时甚至什么题都没认出来但提交按钮已经点下去了，都是这一个根因。
+ *
+ *    现在的三层防护（缺一不可）：
+ *      1) findContainers() 改成**按"哪类选择器认出的完整题目最多"选**，并丢掉同族里包住
+ *         其它题的外层壳；.TiMu=1 vs .questionLi=80 时选后者。
+ *      2) watch() 不再固定 sleep(1000) 就抓，改为等题目数量稳定（或达到页面题量）再抓，
+ *         避免异步逐题渲染时把半成品当整卷。
+ *      3) submit() 顶部加**整卷核对**：页面题量（.infoHead 的「题量: N」/ 答题卡格数 /
+ *         每题一个的隐藏 answer 框）对不上、还有题没作答、或唯一命中的容器是多题外壳，
+ *         一律拒绝提交；loop() 在调 submit 前也会先做同一项检查。
+ *
+ *    另：未确认的「点过提交」记录不再直接当成任务点已完成（见 doneReason）—— 点提交 ≠
+ *    交卷成功，旧逻辑会让用户在提交失败后永远等不到脚本继续作答。
  *
  * 5) 【性能与稳定性约束 —— 改代码前务必先读这段】
  *    这个脚本会同时跑在超星页面的**每一个** frame 里，而超星本身是重 DOM 的重应用，
@@ -285,7 +308,7 @@
   const LOG_KEY = 'cx_auto_logbuf';
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改，
    * 用户日志标错版本、排查被误导。bench/version-test.js 强制校验两处相等。 */
-  const SCRIPT_VERSION = '1.7.7';
+  const SCRIPT_VERSION = '1.7.8';
   /* v1.3.0 答题配置里的占位地址，跟 v1.4.0 的默认值不同，所以判断"用户是否改过地址"时必须显式排除，
    * 否则从没配过答题的老用户会被误判成"自定义接口用户"（bench/config-migration-test.js 冲着这个坑写的）。 */
   const LEGACY_PLACEHOLDER_URL = 'https://your-api.example.com/answer';
@@ -881,6 +904,24 @@
     try { frames = document.querySelectorAll('iframe').length; } catch (e) { /* 忽略 */ }
     try { questions = WorkModule.findContainers().length; } catch (e) { /* 忽略 */ }
     try { probe = questionProbe(); } catch (e) { /* 忽略 */ }
+    /*
+     * 整卷核对结果。诊断里最想回答的两个问题是"为什么只认出 1 道题"和"为什么没提交"，
+     * 这两行把答案直接摊开：认出几道 / 页面题量几道 / 已答几道 / 闸门放不放行。
+     */
+    let paper = null;
+    try {
+      const a = WorkModule.auditPaper();
+      paper = {
+        containers: a.containers,
+        expected: a.expected,
+        answered: a.answered,
+        detectable: a.detectable,
+        complete: a.complete,
+        suspicious: a.suspicious,
+        paginated: a.paginated,
+        why: WorkModule.describeAudit(a),
+      };
+    } catch (e) { paper = null; }
     try { video = !!document.querySelector('video'); } catch (e) { /* 忽略 */ }
     try {
       if (VideoModule.video) {
@@ -905,6 +946,7 @@
       mode: CONFIG.apiMode === 'custom' ? 'custom' : 'ai',
       questions,
       probe,
+      paper,
       watching: !!WorkModule.watching,   // 观察循环活着（与"是否正在请求"无关）
       busy: !!WorkModule.running,        // 正在跑一轮 loop()（可能卡在 API 请求上）
       pending: !!WorkModule.timer,       // 下一次 tick 已排期
@@ -1002,6 +1044,14 @@
           : (r.busy ? '请求中' : (r.watching ? `观察中 ${Math.round((r.wait || 0) / 1000)}s` : '未观察')));
       // 地址截断到 100 字符：诊断输出要被用户整段复制发回来，截太短会把 ?workId= / ?chapterId= 这类关键参数切掉
       out.push(`[${tag}] 题目×${r.questions}  答题:${r.answer ? '开' : '关'}${r.dryRun ? ' [演练]' : ''}  ${state.padEnd(11)} ${String(r.href || '').slice(0, 100)}`);
+      if (r.paper && (r.paper.containers || r.paper.expected)) {
+        // 一行说清"识别对不对、交卷闸门为什么拦/放"
+        out.push(`        整卷: 认出 ${r.paper.containers} 题` +
+          (r.paper.expected ? ` / 页面题量 ${r.paper.expected}` : ' / 题量认不出') +
+          (r.paper.detectable ? ` / 已答 ${r.paper.answered}` : '') +
+          (r.paper.complete ? '  ✓ 允许自动提交' : '  ✗ 交卷闸门会拦'));
+        if (r.paper.why) out.push(`        ${r.paper.why}`);
+      }
       if (r.taskDone) {
         // 明确说出“为什么不答”—— 否则用户会以为脚本坏了
         out.push(`        ✓ 任务点已完成（${r.taskDoneWhy || '未知依据'}），已停止作答`);
@@ -2021,6 +2071,12 @@
 
   const Q_SELECTORS = {
     // 题目容器（按优先级）
+    /*
+     * ⚠ 顺序**不是**"谁先命中就用谁"。真机作业页上 `.TiMu` 是整卷外壳（1 个元素包住 80 道
+     * `.questionLi`），先命中它会得出"本卷只有 1 道题"的结论。真正的选择逻辑在
+     * pickQuestionContainers()：哪一类选择器认出的**完整题目最多**就用哪一类。
+     * 这里的顺序只作为"数量相同时"的优先级。
+     */
     container: ['.TiMu', '.questionLi', '.queBox', '.mark_item', '.subject_describe'],
     // 题干
     stem: ['.Zy_TItle', '.mark_name', '.qtContent', '.TiMu .clearfix', '.subject_describe'],
@@ -2045,6 +2101,18 @@
     ],
     // 弹层里可能充当按钮的元素
     dialogBtn: ['a', 'button', 'input[type="button"]', 'input[type="submit"]', '[class*="btn"]'],
+    /*
+     * 「本卷一共多少题」的页面证据（按可靠性）。作业页顶部 `.infoHead` 有「题量: 80」；
+     * 右侧答题卡 `.topicNumber_list` 每题一格；再不行就数每题一个的隐藏 input[name=answer<qid>]。
+     * 交卷闸门靠它判断"是不是只认出了整卷的一部分"。
+     */
+    paperInfo: ['.infoHead', '.workTitle', '.mark_title'],
+    answerCard: ['.topicNumber_list li', '[id^="answerSheet"]', '.answerCard li', '.card_item'],
+    /*
+     * 分页答题（一页一题）的翻页按钮。页面上还有「下一题」就说明当前 DOM 只是整卷的一页，
+     * 此时交卷 = 只答一页就交 —— 交卷闸门会直接拦下。
+     */
+    nextQuestion: ['#nextQuestion', '.nextQuestion', '.next_question'],
   };
 
   /** 题目容器合并成一个选择器，用于"这个文档里有没有题"的快速判断 */
@@ -2052,6 +2120,70 @@
 
   /** 弹层里的按钮元素，合并成一个选择器 */
   const DIALOG_BTN_ANY = Q_SELECTORS.dialogBtn.join(',');
+
+  /** 数"一道题里有几个题干"用的选择器。刻意**不含** `.TiMu .clearfix`（那是选项行），否则每道题都会被数出 4 个题干。 */
+  const STEM_COUNT_SEL = '.mark_name, .Zy_TItle, .qtContent, .newZy_TItle, .TiMuTitle';
+
+  /** 选项选中态：隐藏 answer 输入框之外的兜底判据（不同超星版本用 cur / selected / on 等） */
+  const OPTION_CHECKED_SEL = '.cur, .selected, .checked, .choose, .choosed, [aria-checked="true"]';
+
+  /* ===== 题目容器选择 BEGIN（bench/question-containers-test.js 按标记提取这段源码）===== */
+
+  /** 从一段文本里读「题量: N」。纯函数，bench 直接测 —— 题量读错会直接决定交卷闸门开不开。 */
+  function parsePaperTotalText(text) {
+    const m = /题量\s*[:：]\s*(\d+)/.exec(String(text == null ? '' : text));
+    return m ? Number(m[1]) || 0 : 0;
+  }
+
+  /**
+   * 从「每个选择器分别命中的元素列表」里挑出真正的题目容器。
+   *
+   * 为什么不能取第一个有命中的选择器：超星作业页（mooc-ans/mooc2/work/dowork）的 DOM 是
+   *     <div class="TiMu">              ← 整卷外壳：1 个，里面 280 个选项
+   *       <div class="questionLi">…</div> × 80
+   *     </div>
+   * 旧实现先试 .TiMu，命中了就返回 → 整卷被当成 1 道题（280 个选项），答完 "1/1" 就点提交。
+   * 现在的判据：**哪一类选择器认出的"完整题目"最多就用哪一类**，再丢掉同类里包住别的题的外壳。
+   *
+   * @param {Array<{sel:string, list:Array}>} groups 每个选择器的命中（保持 Q_SELECTORS 顺序）
+   * @param {(el:any)=>boolean} isQuestion 该元素是否像一道完整题目
+   * @returns {Array} 题目容器（文档顺序）
+   */
+  function pickQuestionContainers(groups, isQuestion) {
+    let best = null;
+    for (const g of groups || []) {
+      if (!g || !g.list || !g.list.length) continue;
+      let valid = [];
+      try { valid = g.list.filter((el) => isQuestion(el)); } catch (e) { valid = []; }
+      if (!valid.length) continue;
+      // 只比数量；数量相同时保留先出现的（Q_SELECTORS.container 的顺序就是优先级）
+      if (!best || valid.length > best.list.length) best = { sel: g.sel, list: valid };
+    }
+    if (!best) return [];
+
+    /*
+     * 同一选择器家族里也可能有"包住整卷"的节点（比如材料题外层也带 .questionLi）。
+     * 只丢"包住另一道**完整**题目"的外层，避免把题干/选项子节点误当成独立题目。
+     */
+    const picked = best.list;
+    let kept = picked;
+    try {
+      kept = picked.filter((el) => !picked.some((o) => o !== el && el.contains && el.contains(o)));
+    } catch (e) { kept = picked; }
+
+    // 文档顺序：题号必须和页面上/答题卡上的顺序一致
+    kept = kept.slice();
+    try {
+      kept.sort((a, b) => {
+        if (a === b) return 0;
+        if (!a.compareDocumentPosition) return 0;
+        return (a.compareDocumentPosition(b) & 4) ? -1 : 1;   // 4 = DOCUMENT_POSITION_FOLLOWING
+      });
+    } catch (e) { /* 排序失败就保持原顺序 */ }
+    return kept;
+  }
+
+  /* ===== 题目容器选择 END ===== */
 
   /* 弹层类名的关键词，给"整页兜底"判断按钮是否长在弹层里用（见 inPopupLike）。 */
   const POPUP_HINT = /layer|popup|dialog|modal|confirm|alert|notice|tips?|mask/i;
@@ -2162,13 +2294,34 @@
   }
 
   /*
+   * 这个文档里有没有"真题目"。**不能只看 QUESTION_ANY 命中**：超星的 .TiMu 有时只是整卷外壳
+   * （甚至空壳），把它当"本层有题"会让 questionRoot() 停在外层，永远不去看真正装着题目的
+   * 同源 iframe —— 表现就是"题目明明在，脚本一道都认不出来"。
+   * .TiMu 必须里面真的有题干/选项，才算这一层有题。
+   */
+  function docHasQuestions(doc) {
+    try {
+      if (!doc) return false;
+      if (doc.querySelector('.questionLi, .queBox, .mark_item')) return true;
+      const timu = doc.querySelector('.TiMu');
+      if (!timu) return false;
+      if (timu.querySelector('.mark_name, .Zy_TItle, .qtContent, .newZy_TItle, .answerBg, .answer_p, .stem_answer, li')) return true;
+      /*
+       * 题干/选项类名都不认识时，只要 .TiMu 里有可输入的控件，也说明这一层真的有题
+       * （填空题常常只有 textarea/input，题干类名各版本不一样）。空壳 .TiMu 没有控件。
+       */
+      return !!timu.querySelector('input, textarea, [contenteditable="true"]');
+    } catch (e) { return false; }
+  }
+
+  /*
    * 题目到底在哪个文档里：超星有些版本把题目放在再套一层的 iframe 里，外壳 frame 的 role 判定对（URL 含 /work/）但 .TiMu 永远是 0，同源时可直接访问 contentDocument 捞题。
    * 但必须跳过"已经有自己脚本实例"的嵌套文档（如 /ananas/modules/work/index.html 套 /mooc-ans/work/doHomeWorkNew，同源且都判为 work），否则会重复调答题 API、重复点同一个 checkbox（点两次等于取消勾选，直接答错）—— 靠 FRAME_MARK 认亲。
    * 跨域访问会抛异常，捕获后跳过。返回：含题目的 Document，或 null。
    */
   function questionRoot() {
     try {
-      if (document.querySelector(QUESTION_ANY)) return document;
+      if (docHasQuestions(document)) return document;
     } catch (e) { /* 选择器异常，继续往下试 */ }
 
     let frames = [];
@@ -2178,7 +2331,7 @@
         const d = f.contentDocument;               // 跨域时抛异常或为 null
         if (!d) continue;
         if (markedByScript(d)) continue;           // 那一层有自己的脚本实例，别抢
-        if (d.querySelector(QUESTION_ANY)) return d;
+        if (docHasQuestions(d)) return d;
       } catch (e) { /* 跨域，跳过 */ }
     }
     return null;
@@ -5204,6 +5357,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     done: false,
     doneWhy: '',
     catalogSkipped: false,   // 只是用来"状态变化时提示一次"，不参与判断
+    /* 「上次点过提交但未收到确认」这条记录被忽略时只提示一次，见 doneReason */
+    latchIgnored: false,
 
     /* 本任务点的题目是否被超星的字体混淆保护（见 detectFontObfuscation）。置位后本轮不再作答、也绝不提交 —— 文本本身就是错的，交一份错卷子更糟。 */
     obfuscated: false,
@@ -5333,16 +5488,35 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
       /*
        * 3) 我们自己点过提交（跨 frame 重载 / 页面重渲染都还在）。放最后：前两道能给出更精确的依据描述，只有它们都失效时才退回这条"我记得我交过"。
+       * ⚠ 未确认的那一档**不能**直接当成完成：点提交 ≠ 交卷成功（二次确认被取消、网络失败、
+       * 接口报错都会留下记录）。v1.7.7 之前只要记录在就永久停止作答，现场表现为"卷子完整地
+       * 摆在页面上，脚本却说任务点已完成、再也不答"。只有页面已经看不到可作答的卷子时才相信它。
        */
       const latch = this.submitLatch();
       if (latch) {
         const mins = Math.max(1, Math.round((Date.now() - (latch.at || 0)) / 60000));
-        return latch.confirmed
-          ? `本任务点已提交（${mins} 分钟前，已收到成功确认）`
-          : `本任务点已点过提交、未收到成功确认（${mins} 分钟前）`;
+        if (latch.confirmed) return `本任务点已提交（${mins} 分钟前，已收到成功确认）`;
+        if (!this.paperStillOpen()) return `本任务点已点过提交、未收到成功确认（${mins} 分钟前），页面已无可作答的卷子`;
+        if (!this.latchIgnored) {
+          this.latchIgnored = true;
+          warn('上次"点过提交"没拿到成功确认，但卷子仍完整地摆在页面上 → 不当作已完成，继续作答');
+        }
       }
 
       return '';
+    },
+
+    /**
+     * 页面上是否还摆着一份可作答的卷子。
+     * 专门给 doneReason 判断"未确认的提交记录"能不能信 —— 提交失败时页面不会消失，
+     * 题目容器和提交按钮都还在，这时必须继续作答而不是永久停手。
+     */
+    paperStillOpen() {
+      try { if (this.findContainers().length) return true; } catch (e) { /* 忽略 */ }
+      try {
+        const btn = this.findSubmit();
+        return !!(btn && isVisible(btn) && !this.isDisabled(btn));
+      } catch (e) { return false; }
     },
 
     /** 页面上"已经交过"的文字证据 */
@@ -5418,6 +5592,45 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         const btn = this.findSubmit();
         return !!(btn && /交卷/.test(buttonText(btn)));
       } catch (e) { return false; }
+    },
+
+    /*
+     * 分页答题（一页一题）的「下一题」。页面上还有它，说明当前 DOM 里只是整卷的一页 ——
+     * 此时交卷 = 只答一页就交，属于最严重的那类错误，所以交卷闸门直接按"未完成"处理。
+     * 只认正向文案，且**排除「下一节」**（那是任务点导航，不是题目翻页）。
+     */
+    findNextQuestionButton() {
+      for (const sel of Q_SELECTORS.nextQuestion) {
+        let list = [];
+        try { list = Array.from(document.querySelectorAll(sel)); } catch (e) { continue; }
+        for (const n of list) {
+          if (isVisible(n) && !this.isDisabled(n)) return n;
+        }
+      }
+      let nodes = [];
+      try {
+        nodes = Array.from(document.querySelectorAll('a, button, div[class*="btn"], span[class*="btn"], li'));
+      } catch (e) { return null; }
+      for (const n of nodes) {
+        const t = buttonText(n);
+        if (!/^(下一题|下一頁|下一部分|下一组)$/.test(t)) continue;
+        if (!isVisible(n) || this.isDisabled(n)) continue;
+        return n;
+      }
+      return null;
+    },
+
+    /** 元素是否处于"禁用/不可点"状态（只看稳定的结构信号，不猜样式） */
+    isDisabled(el) {
+      if (!el) return true;
+      try {
+        if (el.disabled) return true;
+        if (String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
+        const cls = String(el.className || '');
+        if (/(^|\s)(disabled|disable|unactive|forbidden)(\s|$)/i.test(cls)) return true;
+        if (el.style && el.style.pointerEvents === 'none') return true;
+      } catch (e) { /* 忽略 */ }
+      return false;
     },
 
     /*
@@ -5527,9 +5740,11 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           const n = this.findContainers().length;
           if (n > 0) {
             /*
-             * 命中后先停一下再抓：超星是一道一道往 DOM 里塞的，看到第一道就立刻 collect() 会抓到只有一道题的半成品，把其余当成"没答案"跳过。
+             * 等题目全部渲染出来再抓。原实现固定 sleep(1000)：慢网络 / 80 题的大卷上
+             * 只等到 1 道，于是 collect 出 1 道、填完 1 道，total=1 → 直接交卷。
+             * waitForPaper 会等到数量稳定或达到页面题量（最多 6 秒）。
              */
-            await sleep(1000);
+            await this.waitForPaper();
             const r = this.findContainers().length > 0 ? await this.loop() : 'idle';
             this.wait = watchDelay(this.wait, r);
           } else {
@@ -5571,6 +5786,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       this.done = false;
       this.doneWhy = '';
       this.catalogSkipped = false;
+      this.latchIgnored = false;
       /*
        * 字体混淆的判定也重来一次：这是唯一能清掉这道闸门的地方，否则万一是误判脚本就永久停手，用户唯一的自救手段就是点「重新执行」。
        */
@@ -5719,6 +5935,24 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         }
 
         if (CONFIG.autoSubmit) {
+          /*
+           * 交卷前的整卷核对（v1.7.8）。这个判断**不能**只看"这一轮填了几道"：
+           * 抓题只认出 1 道时 filled === total 也成立，旧版就是在这里把整卷交掉的。
+           * 现在拿页面自己的题量 / 答题状态来对，识别数不够就绝不提交。
+           */
+          const audit = this.auditPaper();
+          if (!audit.complete) {
+            this.lastApi = `暂不提交：${this.describeAudit(audit)}`;
+            warn(`本轮回填 ${filled}/${total}，但整卷检查未通过（${this.describeAudit(audit)}），**先不提交**`);
+            if (audit.paginated) {
+              log('  · 分页答题：当前页不是整卷。脚本不自动翻页也不交卷，请逐页完成或手动交卷');
+            } else if (audit.expected && audit.containers < audit.expected) {
+              log('  · 题目可能还没渲染完，下一轮会继续抓；若一直这样，点「结构诊断」把结果发出来');
+            } else if (audit.detectable && audit.answered < audit.containers) {
+              log('  · 还有题没答上，等下一轮重试；可参考题旁红标手动补答');
+            }
+            return 'ok';
+          }
           await sleep(CONFIG.submitDelay);
           await this.submit();
         }
@@ -5783,17 +6017,84 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       return ok;
     },
 
-    /** 题目容器。会自动钻进同源的嵌套 iframe（见 questionRoot 的说明） */
+    /**
+     * 一个候选容器是不是"包住整卷的外壳"。
+     * 判据：一道题里不可能有多个题干，也不可能同时出现几十个选项。
+     * 这是交卷闸门的最后一道保险 —— 哪怕 findContainers 又选错了，这里也能把外壳认出来。
+     */
+    looksLikeWrapper(el) {
+      if (!el) return false;
+      try {
+        if (el.querySelectorAll(STEM_COUNT_SEL).length > 1) return true;
+      } catch (e) { /* 忽略 */ }
+      try {
+        if (this.pickAll(el, Q_SELECTORS.option).length > 30) return true;
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
+
+    /**
+     * 候选元素是否像"一道完整的题"。判据刻意宽松但有下限：
+     *  - 有题目标识（新版 .questionLi 的 typename / data / id=question<qid>）→ 算；
+     *    题目正文/选项可能还在异步加载，不能因为暂时没选项就否掉。
+     *  - 没有标识时，必须有题干，且能抓到选项或填空（真正的题干元素、答题卡格子都不满足）。
+     */
+    looksLikeQuestion(el) {
+      if (!el) return false;
+      try {
+        if (el.id && /^question\d+/i.test(String(el.id))) return true;
+        if (el.getAttribute && (el.getAttribute('typename') || el.getAttribute('qtype'))) return true;
+        const badge = el.querySelector && el.querySelector('.colorShallow');
+        if (badge && /单选|多选|判断|填空|简答|论述|名词解释|其他/.test(badge.textContent || '')) return true;
+      } catch (e) { /* 继续按结构判断 */ }
+
+      const stem = this.pickText(el, Q_SELECTORS.stem);
+      if (!stem) return false;
+      if (this.pickAll(el, Q_SELECTORS.option).length) return true;
+      if (this.pickAll(el, Q_SELECTORS.blank).length) return true;
+      return /简答|论述|名词解释|问答/.test(stem);
+    },
+
+    /** 题目的稳定标识（超星 qid 优先），用于去重签名 —— 不能再用"过滤后的下标"，否则每轮都变 */
+    questionIdOf(el, pos) {
+      try {
+        const raw = el.getAttribute && (el.getAttribute('data') || el.getAttribute('qid'));
+        if (raw) return String(raw);
+        const m = el.id && /^question(\d+)$/i.exec(String(el.id));
+        if (m) return m[1];
+      } catch (e) { /* 忽略 */ }
+      return `idx${pos + 1}`;
+    },
+
+    /**
+     * 题目容器。会自动钻进同源的嵌套 iframe（见 questionRoot 的说明）。
+     *
+     * ⚠ 这里**不能**"第一个命中的选择器直接返回"：真机作业页上 `.TiMu` 是整卷外壳（1 个），
+     * 里面才是 80 个 `.questionLi`；先命中 `.TiMu` 会让整卷被当成 1 道题（280 个选项），
+     * 答完 "1/1" 就直接交卷 —— v1.7.7 之前被报告的严重问题就是这个。
+     * 现在交给 pickQuestionContainers()：哪类选择器认出的完整题目最多就用哪类。
+     */
     findContainers() {
       const root = questionRoot();
       if (!root) return [];
+
+      const groups = [];
       for (const sel of Q_SELECTORS.container) {
-        try {
-          const list = Array.from(root.querySelectorAll(sel));
-          if (list.length) return list;
-        } catch (e) { /* 忽略 */ }
+        let list = [];
+        try { list = Array.from(root.querySelectorAll(sel)); } catch (e) { continue; }
+        if (list.length) groups.push({ sel, list });
       }
-      return [];
+
+      /*
+       * 同一轮里缓存"像不像一道题"的判定：80 道题 × 多个选择器时，不缓存就要对同一个
+       * 元素反复查 DOM，而 findContainers 每 2 秒就被 watch 调一次。
+       */
+      const memo = new Map();
+      const isQ = (el) => {
+        if (!memo.has(el)) memo.set(el, this.looksLikeQuestion(el));
+        return memo.get(el);
+      };
+      return pickQuestionContainers(groups, isQ);
     },
 
     /** 抓取题目：题干 + 选项 + 题型 */
@@ -5804,21 +6105,47 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       const doc = questionRoot() || document;
       const dec = (s) => SecretFont.decode(doc, s);
 
-      // 跳过已经被填过的题（可能是本 frame 之前填的，也可能是同源的另一层 frame 填的）
-      const containers = this.findContainers().filter((el) => {
+      /*
+       * 全部容器（含已填的）用来定题号；FILLED_MARK 只用来跳过重复作答。
+       * 题号必须来自**完整列表**：若先把已填的过滤掉，后面每道题的下标都会前移，
+       * id / sig 每轮都变，handled 去重和"第 N 题"日志都会错位。
+       */
+      const all = this.findContainers();
+      const posOf = new Map();
+      all.forEach((el, i) => posOf.set(el, i));
+      const containers = all.filter((el) => {
         try { return !el.hasAttribute(FILLED_MARK); } catch (e) { return true; }
       });
-      return containers.map((el, idx) => {
+
+      return containers.map((el) => {
+        const pos = posOf.has(el) ? posOf.get(el) : 0;
+
+        /*
+         * 防御：外层壳被当成一道题时，这里会看到几十个题干/几百个选项。绝不能发出去 ——
+         * 模型会把它当一道超长选择题答，回填只点一个选项，然后 total=1 直接交卷。
+         */
+        if (this.looksLikeWrapper(el)) {
+          warn(`题目容器 ${el.className || el.tagName} 里包含多道题/过多选项，疑似整卷外壳，已跳过`);
+          return null;
+        }
+
         const stem = dec(this.pickText(el, Q_SELECTORS.stem) || '');
         const optionEls = this.pickAll(el, Q_SELECTORS.option);
 
-        // 解析每个选项行的「字母 + 正文」。字母优先从文本里抠，抠不到就按位置推。
+        // 解析每个选项行的「字母 + 正文」。字母优先读超星的 data 属性，比从文本里抠可靠。
         const parsed = optionEls.map((o, i) => {
           const raw = dec((o.textContent || '').replace(/\s+/g, ' ').trim());
+          let key = '';
+          try {
+            const lab = o.querySelector('.num_option, .num_option_dx, [data]');
+            const d = lab && String(lab.getAttribute('data') || '');
+            if (/^[A-Za-z]$/.test(d)) key = d.toUpperCase();
+          } catch (e) { /* 忽略 */ }
           // 选项形如 "A、内容" / "A 内容" / "内容"
           const m = raw.match(/^([A-Za-z])[、.．\s]+(.*)$/);
-          const key = m ? m[1].toUpperCase() : String.fromCharCode(65 + i);
-          const text = m ? m[2].trim() : raw;
+          if (!key && m) key = m[1].toUpperCase();
+          const text = (m ? m[2] : raw).trim();
+          if (!key) key = String.fromCharCode(65 + i);
           return { key, text, el: o };
         });
 
@@ -5834,25 +6161,39 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
         const blanks = this.pickAll(el, Q_SELECTORS.blank);
 
-        // 题型推断
+        /*
+         * 题型：优先读容器自带的 typename（新版作业页 div.questionLi[typename="多选题"]），
+         * 比从题干文本猜可靠得多；题干里的「(单选题, 1分)」也可能被字体混淆/清洗掉。
+         */
+        let typeHint = '';
+        try { typeHint = String(el.getAttribute('typename') || el.getAttribute('qtype') || ''); } catch (e) { /* 忽略 */ }
+        if (!typeHint) {
+          try {
+            const n = el.querySelector('.newZy_TItle, .TiMuTitle, .mark_type, .colorShallow');
+            typeHint = (n && n.textContent) || '';
+          } catch (e) { /* 忽略 */ }
+        }
+        if (!typeHint) typeHint = stem;
+
         let type = 'single';
-        const typeHint = ((el.querySelector('.newZy_TItle, .TiMuTitle, .mark_type') || {}).textContent || stem || '');
         if (/多选/.test(typeHint)) type = 'multi';
         else if (/判断/.test(typeHint)) type = 'judge';
         else if (/填空/.test(typeHint) || blanks.length) type = 'blank';
-        else if (/简答|论述|名词解释/.test(typeHint)) type = 'essay';
+        else if (/简答|论述|名词解释|问答/.test(typeHint)) type = 'essay';
         else {
-          const multi = el.querySelector('input[type="checkbox"]');
-          const radio = el.querySelector('input[type="radio"]');
-          if (multi) type = 'multi';
-          else if (!radio && !options.length) type = 'blank';
+          try {
+            if (el.querySelector('input[type="checkbox"]')) type = 'multi';
+            else if (!el.querySelector('input[type="radio"]') && !options.length) type = 'blank';
+          } catch (e) { /* 忽略 */ }
         }
 
-        const sig = `${idx}::${stem.slice(0, 80)}`;
+        const qid = this.questionIdOf(el, pos);
+        const sig = `${qid}::${stem.replace(/\s+/g, '').slice(0, 80)}`;
 
         return {
-          id: `q${idx + 1}`,
-          index: idx,
+          id: `q${pos + 1}`,
+          index: pos,
+          qid,
           type,
           question: stem.replace(/\s+/g, ' ').trim(),
           options: options.map(({ key, text }) => ({ key, text })),
@@ -5863,7 +6204,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           optionByKey,                  // 字母 → 元素，不受过滤影响
           blankEls: blanks,
         };
-      }).filter((q) => q.question);
+      }).filter((q) => q && q.question);
     },
 
     pickText(root, selectors) {
@@ -5882,6 +6223,246 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         if (filtered.length) return filtered;
       }
       return [];
+    },
+
+    /* ---------- 整卷核对（交卷闸门） ---------- */
+
+    /**
+     * 页面自己声明的题量。只靠"我认出了几道"会在识别失败时得出"全部答完"的结论，
+     * 所以交卷前必须和页面自己的数字核对一次。认不出来返回 0（不启用数量门槛）。
+     * 依次尝试：题量文案 → 答题卡格子数 → 每题一个的隐藏 answer 框 → 整页文本里的题量。
+     */
+    paperTotal() {
+      let root = document;
+      try { root = questionRoot() || document; } catch (e) { root = document; }
+
+      // 1) 顶部「题量: 80」
+      for (const sel of Q_SELECTORS.paperInfo) {
+        let n = null;
+        try { n = root.querySelector(sel); } catch (e) { continue; }
+        if (!n) continue;
+        const total = parsePaperTotalText(n.textContent || '');
+        if (total) return total;
+      }
+
+      // 2) 右侧答题卡：每题一格（作业页 .topicNumber_list li[id=answerSheet<qid>]）
+      for (const sel of Q_SELECTORS.answerCard) {
+        let list = [];
+        try { list = Array.from(root.querySelectorAll(sel)); } catch (e) { continue; }
+        if (list.length) return list.length;
+      }
+
+      // 3) 每题一个的隐藏 input[name="answer<qid>"]（作业页提交时读的就是它）
+      let hidden = 0;
+      try {
+        for (const inp of root.querySelectorAll('input[type="hidden"]')) {
+          const key = String(inp.name || inp.id || '');
+          if (/^answer\d+$/.test(key)) hidden++;
+        }
+      } catch (e) { /* 忽略 */ }
+      if (hidden) return hidden;
+
+      // 4) 兜底：整页文本里的「题量: N」（面板被改版挪走时）
+      try {
+        const total = parsePaperTotalText((root.body && root.body.textContent) || '');
+        if (total) return total;
+      } catch (e) { /* 忽略 */ }
+      return 0;
+    },
+
+    /**
+     * 一道题在页面上是否已有作答。**以页面自己的提交数据为准**：
+     *  - 作业页每题有一个隐藏 input[name="answer<qid>"]，addChoice 会同步它，提交时读的也是它；
+     *  - 再看选项的 aria-checked / 选中类名，兜住隐藏 input 没同步的版本；
+     *  - 最后看填空/文本域/富文本的内容。
+     * 返回 { answered, how, detectable }：detectable 表示这一页有没有"能读出作答状态"的机制。
+     * 三者缺一不可：交卷闸门要靠 detectable 区分"没答"和"这个版本根本读不出状态"。
+     */
+    isAnswered(el) {
+      const out = { answered: false, how: '', detectable: false };
+      if (!el) return out;
+
+      // 1) 隐藏的 answer 输入框（最高优先：提交读的就是它）
+      try {
+        for (const inp of el.querySelectorAll('input[type="hidden"]')) {
+          const key = String(inp.name || inp.id || '');
+          if (!/^answer\d+$/.test(key)) continue;
+          out.detectable = true;
+          if (String(inp.value == null ? '' : inp.value).trim()) {
+            out.answered = true;
+            out.how = `隐藏框 ${key}`;
+            return out;
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+
+      // 2) 原生 radio / checkbox
+      try {
+        if (el.querySelector('input[type="radio"], input[type="checkbox"]')) out.detectable = true;
+        if (el.querySelector('input[type="radio"]:checked, input[type="checkbox"]:checked')) {
+          out.answered = true;
+          out.how = '原生选中';
+          return out;
+        }
+      } catch (e) { /* 忽略 */ }
+
+      // 3) 选项选中态 / aria-checked（超星的选项是 div.answerBg，不是原生 radio）
+      let opts = [];
+      try { opts = this.pickAll(el, Q_SELECTORS.option); } catch (e) { opts = []; }
+      for (const o of opts) {
+        try {
+          if (o.hasAttribute && o.hasAttribute('aria-checked')) out.detectable = true;
+          if ((o.matches && o.matches(OPTION_CHECKED_SEL)) ||
+              (o.querySelector && o.querySelector(OPTION_CHECKED_SEL))) {
+            out.answered = true;
+            out.how = '选项选中态';
+            return out;
+          }
+        } catch (e) { /* 单个选项失败不影响其它 */ }
+      }
+
+      // 4) 填空 / 简答（含 UEditor 富文本）
+      let blanks = [];
+      try { blanks = this.pickAll(el, Q_SELECTORS.blank); } catch (e) { blanks = []; }
+      if (blanks.length) out.detectable = true;
+      for (const b of blanks) {
+        try {
+          const tag = String(b.tagName || '').toUpperCase();
+          if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            if (String(b.value || '').trim()) {
+              out.answered = true;
+              out.how = '输入框有内容';
+              return out;
+            }
+          } else if (String(b.textContent || '').trim()) {
+            out.answered = true;
+            out.how = '可编辑区有内容';
+            return out;
+          }
+        } catch (e) { /* 忽略 */ }
+      }
+      try {
+        for (const box of el.querySelectorAll('.edui-body-container, .edui-iframe')) {
+          let d = null;
+          try { d = box.contentDocument; } catch (e) { d = null; }
+          const text = (d && d.body ? d.body.textContent : box.textContent) || '';
+          if (String(text).trim()) {
+            out.answered = true;
+            out.how = '富文本有内容';
+            return out;
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+
+      /*
+       * 5) 脚本自己填过 —— 只在这一页**没有**可读作答状态时兜底。
+       * 有隐藏框却还是空的时候不能信这个标记：那说明点击没真正落到页面的作答逻辑上。
+       */
+      try {
+        if (!out.detectable && el.hasAttribute && el.hasAttribute(FILLED_MARK)) {
+          out.answered = true;
+          out.how = '脚本已填';
+        }
+      } catch (e) { /* 忽略 */ }
+      return out;
+    },
+
+    /**
+     * 交卷前的全卷核对。返回的对象是 submit() 的放行依据：
+     *  - containers：这次认出了几道题；
+     *  - expected  ：页面自己声明的题量（0 = 认不出，不启用数量门槛）；
+     *  - answered  ：能读出作答状态时，已作答几道；
+     *  - suspicious：唯一命中的容器是多题外壳；
+     *  - paginated ：页面上还有「下一题」（当前页不是整卷）；
+     *  - complete  ：全部通过才允许点提交。
+     */
+    auditPaper() {
+      let containers = [];
+      try {
+        /*
+         * 只统计"真的有题干"的容器：留着还没渲染完/隐藏模板的空壳会让题数虚高，
+         * 进而把一份其实已经答完的卷子判成"还有题没作答"。
+         */
+        containers = this.findContainers().filter((el) => {
+          try { return !!String(this.pickText(el, Q_SELECTORS.stem) || '').trim(); } catch (e) { return false; }
+        });
+      } catch (e) { containers = []; }
+
+      let expected = 0;
+      try { expected = this.paperTotal(); } catch (e) { expected = 0; }
+
+      const unanswered = [];
+      let answered = 0;
+      let detectable = false;
+      for (const el of containers) {
+        let st = { answered: false, how: '', detectable: false };
+        try { st = this.isAnswered(el); } catch (e) { /* 忽略 */ }
+        if (st.detectable) detectable = true;
+        if (st.answered) answered++;
+        else unanswered.push(el);
+      }
+
+      const suspicious = containers.length === 1 && this.looksLikeWrapper(containers[0]);
+      const paginated = !!this.findNextQuestionButton();
+      const countOk = expected === 0 || containers.length >= expected;
+      // 页面能读出作答状态时必须每一道都答了；读不出状态时只能信调用方（loop 的 filled）
+      const answeredOk = !detectable || unanswered.length === 0;
+      const complete = containers.length > 0 && countOk && answeredOk && !suspicious && !paginated;
+
+      return {
+        containers: containers.length,
+        expected,
+        answered,
+        unanswered,
+        detectable,
+        suspicious,
+        paginated,
+        countOk,
+        answeredOk,
+        complete,
+      };
+    },
+
+    /** 把 auditPaper() 的结果翻译成"用户看得懂、能行动"的一句话 */
+    describeAudit(a) {
+      if (!a) return '检查失败';
+      const parts = [];
+      if (!a.containers) parts.push('一道题都没认出来');
+      else parts.push(`认出 ${a.containers} 道题`);
+      if (a.expected) parts.push(`页面题量 ${a.expected} 道`);
+      if (a.detectable) parts.push(`已作答 ${a.answered} 道`);
+      if (a.suspicious) parts.push('唯一命中的容器里有多道题/几十个选项（疑似整卷外壳）');
+      if (a.paginated) parts.push('页面上还有「下一题」（分页答题，当前页不是整卷）');
+      if (a.expected && a.containers < a.expected) parts.push('识别到的题数少于页面题量');
+      if (a.detectable && a.answered < a.containers) parts.push(`还有 ${a.containers - a.answered} 道没作答`);
+      return parts.join('，');
+    },
+
+    /**
+     * 等题目渲染到稳定数量再抓。超星是异步逐题往 DOM 里塞的：原来固定 sleep(1000)，
+     * 慢网络 / 80 题的大卷上只等到 1 道，于是 total=1、filled=1 → 直接交卷。
+     * 判据：达到页面声明的题量，或连续两轮（约 800ms）数量不变；最多等 6 秒。
+     */
+    async waitForPaper() {
+      const t0 = Date.now();
+      let last = -1;
+      let stable = 0;
+      while (Date.now() - t0 < 6000) {
+        let n = 0;
+        try { n = this.findContainers().length; } catch (e) { n = 0; }
+        let expected = 0;
+        try { expected = this.paperTotal(); } catch (e) { expected = 0; }
+        if (n > 0 && expected > 0 && n >= expected) return n;
+        if (n > 0 && n === last) {
+          stable++;
+          if (stable >= 2) return n;
+        } else {
+          stable = 0;
+        }
+        last = n;
+        await sleep(400);
+      }
+      try { return this.findContainers().length; } catch (e) { return 0; }
     },
 
     /* ---------- 调外部 API ---------- */
@@ -6305,11 +6886,26 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
        */
       if (this.examLike() && !CONFIG.examAutoSubmit) {
         warn('考试页未勾选「考试自动交卷」——submit() 拒绝点「交卷」；答案已回填，请人工交卷');
-        return;
+        return false;
       }
+
+      /*
+       * 交卷前的全卷安全闸门（v1.7.8）—— 这是"只认出 1 道题就交卷 / 什么都没认出来也交卷"的
+       * 最后一道防线。必须长在 submit 自身最顶部：loop() 之外，面板「重新执行」或将来新增的
+       * 路径都可能直调 submit()。
+       * 误拦的代价是用户手动点一下提交；误放的代价是白卷/只答一题就交卷，而很多测验只给一次机会。
+       */
+      const audit = this.auditPaper();
+      if (!audit.complete) {
+        this.lastApi = `已拦截提交：${this.describeAudit(audit)}`;
+        warn(`⛔ 拒绝提交：${this.describeAudit(audit)}`);
+        warn('  · 脚本没有点提交。请确认题目全部渲染/作答后重试，或手动检查后提交');
+        return false;
+      }
+
       const btn = this.findSubmit();
-      if (!btn) return warn('未找到提交按钮，请手动提交');
-      if (CONFIG.submitConfirm && !confirm('超星助手：确认提交本次作业？')) return log('已取消提交');
+      if (!btn) { warn('未找到提交按钮，请手动提交'); return false; }
+      if (CONFIG.submitConfirm && !confirm('超星助手：确认提交本次作业？')) { log('已取消提交'); return false; }
 
       log('点击提交');
       /*
@@ -6326,12 +6922,14 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
                ? '页面还有未处理的确认弹窗，请手动点掉后再确认是否已提交'
                : '请手动确认是否已提交'));
         /*
-         * 这里**不 markDone**：提交到底成没成功并不知道，谎报"已完成"会让诊断误导人。但上面那条记录已经落下，下一轮 doneReason() 会按"已点过提交、未确认"停下，于是不会再重答一遍，也不会再点一次提交。
+         * 这里**不 markDone**：提交到底成没成功并不知道，谎报"已完成"会让诊断误导人。
+         * 上面那条记录已经落下，但 doneReason() 只在"页面已无可作答的卷子"时才认它，
+         * 所以提交失败（卷子还在）不会把脚本永久挡在门外。
          */
         if (!latched) {
           warn('（本任务点没识别出唯一标识，无法落"已提交"记录 —— 若脚本又答了一遍，请把「诊断」里的「本任务点标识」发出来）');
         }
-        return;
+        return false;
       }
 
       log('已确认提交成功 ✓');
@@ -6340,6 +6938,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
        */
       this.markDone('已提交成功');
       this.confirmSubmitLatch();   // 把记录升级成"已确认"，诊断里能区分
+      return true;
     },
 
     /**
@@ -7139,6 +7738,14 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           `已处理题目: ${WorkModule.handled.size} 道`,
           WorkModule.lastApi ? `最近作答: ${WorkModule.lastApi}` : '',
           `题目容器命中: ${questionProbe()}`,
+          `选中的题目容器: ${(() => { try { return WorkModule.findContainers().length + ' 道'; } catch (e) { return '异常：' + (e.message || e); } })()}`,
+          `页面题量: ${(() => { try { return WorkModule.paperTotal() || '**认不出**'; } catch (e) { return '异常'; } })()} 道`,
+          `整卷检查: ${(() => {
+            try {
+              const a = WorkModule.auditPaper();
+              return WorkModule.describeAudit(a) + (a.complete ? ' → 允许自动提交' : ' → **拒绝自动提交**');
+            } catch (e) { return '异常：' + (e.message || e); }
+          })()}`,
           `本 frame 内 iframe 数: ${frames}${frames && !WorkModule.findContainers().length ? '（题目可能在更深一层 frame 里）' : ''}`,
           '',
           `视频元素: ${v ? (v.isConnected ? '已接管且在文档中' : '已接管但已游离') : '未接管'}`,
@@ -7192,6 +7799,11 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         out.push(`── 结构诊断 ${new Date().toLocaleTimeString()} ──`);
         out.push(`地址: ${location.href.slice(0, 100)}`);
         out.push(`题目容器命中: ${questionProbe()}`);
+        out.push(`选中的题目容器: ${(() => { try { return WorkModule.findContainers().length + ' 道'; } catch (e) { return '异常'; } })()}`);
+        out.push(`页面题量: ${(() => { try { return WorkModule.paperTotal() || '认不出'; } catch (e) { return '异常'; } })()} 道`);
+        out.push(`整卷检查: ${(() => {
+          try { return WorkModule.describeAudit(WorkModule.auditPaper()); } catch (e) { return '异常'; }
+        })()}`);
 
         const qs = WorkModule.collect();
         out.push(`解析出题目: ${qs.length} 道`);
