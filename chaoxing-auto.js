@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.7.9
+// @version      1.7.10
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -163,6 +163,16 @@
  *    日志刷「题目容器 TiMu newTiMu 里包含多道题/过多选项」。现在只认两个强证据：
  *    容器里包住 ≥2 道完整题目，或选项数 > 30。正常题（哪怕有两个题干类名）不再被误伤。
  *
+ *    【v1.7.10：PPT/PDF 无法自动阅读】
+ *    PPT/PDF 任务点的真实阅读器是**跨域 iframe**：
+ *        /ananas/modules/pdf/index.html          ← 外层，同源，脚本原来只在这里找翻页按钮
+ *          └─ pan-yz.chaoxing.com/screen/v2/file_…  ← 真正的内容：34 张图片纵向排列
+ *    外层拿不到阅读器的 document，阅读器也没有「下一页」按钮；它自己的 $(window).scroll
+ *    滚到底后会 parent.postMessage({isFinished:1})，外层 wpsMessageCallBack 收到才调
+ *    finishJob()。旧版 detectRole() 不认识 pan-yz 路径，DocModule 在阅读器这一层从没启动，
+ *    于是永远没人滚动 → 永远不完成。现在把 pan-yz 认成 doc，由 DocModule 在阅读器自己这一层
+ *    分步滚到底，完成链路自然跑通（不伪造任何上报）。
+ *
  * 5) 【性能与稳定性约束 —— 改代码前务必先读这段】
  *    这个脚本会同时跑在超星页面的**每一个** frame 里，而超星本身是重 DOM 的重应用，
  *    所以任何"每次 DOM 变更都执行"或"和页面无限拉锯"的逻辑，都会被放大成卡顿甚至内存溢出。
@@ -314,7 +324,7 @@
   const LOG_KEY = 'cx_auto_logbuf';
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改，
    * 用户日志标错版本、排查被误导。bench/version-test.js 强制校验两处相等。 */
-  const SCRIPT_VERSION = '1.7.9';
+  const SCRIPT_VERSION = '1.7.10';
   /* v1.3.0 答题配置里的占位地址，跟 v1.4.0 的默认值不同，所以判断"用户是否改过地址"时必须显式排除，
    * 否则从没配过答题的老用户会被误判成"自定义接口用户"（bench/config-migration-test.js 冲着这个坑写的）。 */
   const LEGACY_PLACEHOLDER_URL = 'https://your-api.example.com/answer';
@@ -790,6 +800,14 @@
   /* ⚠️ read 必须留在这个列表里。超星「阅读」任务点的路径是 /ananas/modules/read/indexV2.html； 漏掉它 → 落到下面的 DOM 兜底 → 没有题目也没有
    * video → 返回 unknown → DocModule.start() 从来没被 调用过，表现为"文档模块是死的"：docEnabled 开着也毫无动静，日志里连启动行都没有。 */
     if (/\/ananas\/modules\/(read|pdf|doc|ppt|book|document)\//i.test(path)) {
+      return 'doc';
+    }
+    /*
+     * PPT/PDF 的图片阅读器是**跨域 iframe**（pan-yz.chaoxing.com/screen/v2/file_…），
+     * 外层 pdf/index.html 进不去它的 document，只能由它自己滚到底后 postMessage 通知
+     * 外层 finishJob()。必须把它也认成 doc，让 DocModule 注入到这一层并负责滚动。
+     */
+    if (PAN_VIEW_RE.test(path)) {
       return 'doc';
     }
 
@@ -7216,6 +7234,14 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
    */
   const READ_TASK_RE = /\/ananas\/modules\/read\/|\/coursedata\/readjobv2\//i;
 
+  /*
+   * PPT / PDF 的图片阅读器（pan-yz.chaoxing.com/screen/v2/file_<objectid>）。
+   * 这是一层**跨域 iframe**：外层 pdf/index.html 拿不到它的 document，只能靠它自己
+   * 滚到底后 parent.postMessage({isFinished:1}) 来通知外层 finishJob()。
+   * 所以必须让脚本**注入到阅读器自己这一层**，由 DocModule 在这里执行滚动。
+   */
+  const PAN_VIEW_RE = /\/screen\/v2\/file_/i;
+
   function isReadingTimeTask() {
     try {
       if (READ_TASK_RE.test(location.pathname)) return true;
@@ -7231,6 +7257,9 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     timer: null,
     stopped: false,
     done: false,
+    readerBottomLogged: false,
+    readerScrollLoggedAt: 0,
+    readerScrollCount: 0,
 
     start() {
       if (!CONFIG.docEnabled) return;
@@ -7246,9 +7275,18 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         return;
       }
 
-      log('文档阅读模块启动');
       this.done = false;
       this.stopped = false;
+      this.readerBottomLogged = false;
+      this.readerScrollLoggedAt = 0;
+      this.readerScrollCount = 0;
+
+      if (PAN_VIEW_RE.test(location.pathname)) {
+        log('PPT/PDF 图片阅读器：自动滚动模式（滚到底后由阅读器自己上报完成）');
+      } else {
+        log('文档阅读模块启动');
+      }
+
       this.tick();
       // 用 setTimeout 递归而不是 setInterval：文档加载慢时不会堆积回调
       const loop = () => {
@@ -7263,6 +7301,56 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (this.timer) Timers.clear(this.timer);
     },
 
+    /**
+     * PPT/PDF 图片阅读器（pan-yz.chaoxing.com/screen/v2/file_…）专用滚动。
+     *
+     * 为什么必须在这里滚：阅读器是跨域 iframe，外层 pdf/index.html 拿不到它的 document。
+     * 阅读器自己的 `$(window).scroll` 在滚到底（容差 40px）时会 `parent.postMessage({isFinished:1})`，
+     * 外层 `wpsMessageCallBack` 收到后调用 finishJob() 完成任务点。所以脚本只要在**阅读器
+     * 自己这一层**把页面滚到底，整条完成链路就会自然跑通，不需要伪造任何上报。
+     *
+     * 分步滚动而不是一次跳底：一次跳底虽然也能触发 scroll 事件，但页面看起来像"瞬移"，
+     * 分步更接近真实阅读，也避免部分版本对一次性大跳的滚动事件做节流。
+     */
+    scrollReader() {
+      const doc = document.scrollingElement || document.documentElement;
+      const total = Math.max(doc.scrollHeight || 0, document.body ? document.body.scrollHeight : 0);
+      const view = window.innerHeight || doc.clientHeight || 800;
+      const cur = window.pageYOffset || doc.scrollTop || 0;
+
+      if (total <= view + 80) {
+        // 内容还没加载出来（或本来就不需要滚动）：等下一轮，别提前报完成
+        return;
+      }
+
+      const atBottom = cur + view >= total - 60;
+      if (atBottom) {
+        if (!this.readerBottomLogged) {
+          this.readerBottomLogged = true;
+          log('PPT/PDF 阅读器：已滚动到最后一页，等待页面自己上报完成（不要手动关掉）');
+        }
+        return;
+      }
+
+      // 阅读器页面很长（34 页 PPT 可能 2~3 万像素），每轮 1 屏、2~3 秒，既稳又不会太快
+      if (!breaker.allow('阅读器滚动', 240, 60000)) return;
+      const step = Math.max(Math.round(view * 0.9), 400);
+      const next = Math.min(cur + step, total);
+      try {
+        window.scrollTo({ top: next, behavior: 'smooth' });
+      } catch (e) {
+        try { window.scrollTo(0, next); } catch (e2) { /* 忽略 */ }
+      }
+      this.readerScrollCount++;
+
+      const now = Date.now();
+      if (!this.readerScrollLoggedAt || now - this.readerScrollLoggedAt > 8000) {
+        this.readerScrollLoggedAt = now;
+        const pct = total > 0 ? Math.min(100, Math.round((next / total) * 100)) : 0;
+        log(`PPT/PDF 阅读器：自动滚动 ${pct}%（第 ${this.readerScrollCount} 次，${Math.round(cur)}/${total}px）`);
+      }
+    },
+
     tick() {
       // 翻到最后一页且页面出现完成标记时，才算这个任务点结束
       if (CONFIG.requireComplete && Completeness.markFound()) {
@@ -7270,6 +7358,15 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           this.done = true;
           log('文档任务点已完成 ✓');
         }
+        return;
+      }
+
+      /*
+       * PPT/PDF 图片阅读器：整页图片纵向排列，没有"下一页"按钮，唯一正确的做法是滚动。
+       * 必须放在翻页按钮之前 —— 阅读器里也可能有别的 .next 元素，误点不如滚动安全。
+       */
+      if (PAN_VIEW_RE.test(location.pathname)) {
+        this.scrollReader();
         return;
       }
 
