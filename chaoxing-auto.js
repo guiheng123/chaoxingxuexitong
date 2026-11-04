@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.9.5
+// @version      1.9.7
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -93,6 +93,8 @@
     answerEnabled: false,
   /* 在每道题旁显示 AI 作答进度徽标。 */
     showProgress: true,
+  /* 把题干/选项里的图片一起发给模型（超星把公式渲染成图片，纯图片选项没有文字）。 */
+    sendImages: true,
   /* 作答方式：'per' 逐题作答（默认，一次请求只发一道题，拿到答案立刻回填）／'batch' 整卷一次。 */
     answerMode: 'per',
     /* 逐题模式下，某道题没答上时额外重试几次（超过就放弃，不再无限打接口） */
@@ -105,6 +107,8 @@
     apiUrl: 'https://api.openai.com/v1',
     apiKey: '',
     apiModel: 'gpt-4o-mini',
+    /* 视觉模型：留空 = 直接把图片附给主模型（主模型必须支持视觉）；填了 = 先用它把图片转成文字 */
+    visionModel: '',
     apiUrlFull: false,         // 勾上表示地址已是完整端点，不再自动补 /chat/completions
     promptTemplate: DEFAULT_PROMPT,
     apiTimeout: 60000,         // 大模型比题库慢，默认给到 60s（旧版 30s 经常不够）
@@ -148,7 +152,7 @@
     } catch (e) { return 'p?'; }
   })();
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改， */
-  const SCRIPT_VERSION = '1.9.5';
+  const SCRIPT_VERSION = '1.9.7';
   /* 版本变了就清空旧日志缓冲：旧版本写的行没有分组标记，面板没法判断它属于哪个页面。 */
   try {
     const LOG_VERSION_KEY = 'cx_auto_logver';
@@ -5502,11 +5506,14 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     // 哪些字母是有元素的 —— 这一项直接暴露"字母取不到元素"的错位
     const mapped = Object.keys(byKey).sort().join('');
     const letters = opts.map((o) => String(o.key).toUpperCase()).sort().join('');
+    // 输入区标签：BODY = 富文本 iframe，TEXTAREA/INPUT = 普通输入框
+    const blankTags = (q.blankEls || []).map((el) => String(el.tagName || '').toUpperCase()).join('/');
 
     return `第${(q.index ?? 0) + 1}题 [${q.type}] 选项${opts.length}个/元素${allEls.length}个` +
            `${letters ? ` 字母=${letters}` : ''}` +
            `${mapped && mapped !== letters ? ` ⚠映射=${mapped}(与字母不一致)` : ''}` +
-           ` 填空元素=${(q.blankEls || []).length}` +
+           ` 填空元素=${(q.blankEls || []).length}${blankTags ? `(${blankTags})` : ''}` +
+           ` 图片=${(q.images || []).length}/${Object.keys(q.optionImages || {}).length}` +
            ` 题干="${String(q.question || '').slice(0, 30)}"` +
            `${opts.length ? `\n      选项明细: ${optTxt}` : ''}`;
   }
@@ -5525,6 +5532,10 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     lastApi: '',          // 最近一次答题请求的结果，诊断用
     /* 正在进行的请求，null 表示当前没有请求在飞。 */
     req: null,
+    /* 网关/模型不接受图片时置位：本页后续请求不再带图，避免每题都先失败一次。 */
+    imageOff: false,
+    /* 图片地址 → data: URL 的缓存（同一张公式图只抓一次）。 */
+    imgCache: null,
 
     /* 本任务点是否已完成。 */
     done: false,
@@ -5892,6 +5903,18 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (this.timer) { Timers.clear(this.timer); this.timer = null; }
     },
 
+    /* 清掉页面上的"已填"标记与内存里的处理记录，让重新执行真的重来一遍 */
+    clearFilledMarks() {
+      try { this.handled.clear(); } catch (e) { /* 忽略 */ }
+      try { this.qTries.clear(); } catch (e) { /* 忽略 */ }
+      try {
+        const root = questionRoot() || document;
+        Array.from(root.querySelectorAll('[' + FILLED_MARK + ']')).forEach((el) => {
+          try { el.removeAttribute(FILLED_MARK); } catch (e) { /* 忽略 */ }
+        });
+      } catch (e) { /* 忽略 */ }
+    },
+
     /* 由「重新执行」触发：停掉当前观察，重新来一遍 */
     restart() {
       this.stop();
@@ -5903,9 +5926,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       this.doneWhy = '';
       this.catalogSkipped = false;
       this.latchIgnored = false;
+      this.imageOff = false;      // 重新执行时再试一次带图
       /* 字体混淆的判定也重来一次：这是唯一能清掉这道闸门的地方，否则万一是误判脚本就永久停手，用户唯一的自救手段就是点「重新执行」。 */
       this.obfuscated = false;
       this.obfChecked = false;
+      /* 手动重新执行 = 全部重来：不清"已填"标记的话，上次填过但没落到编辑器里的题会被整批跳过 */
+      this.clearFilledMarks();
       if (CONFIG.answerEnabled) this.watch();
     },
 
@@ -6205,17 +6231,24 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           if (!key && m) key = m[1].toUpperCase();
           const text = (m ? m[2] : raw).trim();
           if (!key) key = String.fromCharCode(65 + i);
-          return { key, text, el: o };
+          return { key, text, el: o, img: optionImageOf(o) };
         });
 
-        // 发给 API 的选项表：正文为空的（比如纯图片选项）没有意义，去掉
-        const options = parsed.filter((o) => o.text);
+        /* 发给 API 的选项表：正文为空但**有图**的选项必须留着（纯图片选项），去掉它模型就看不见选项 */
+        const options = parsed.filter((o) => o.text || o.img);
 
         /* key → 选项元素 的映射，从**未过滤**的 parsed 建。 */
         const optionByKey = {};
         for (const o of parsed) if (!optionByKey[o.key]) optionByKey[o.key] = o.el;
 
-        const blanks = this.pickAll(el, Q_SELECTORS.blank);
+        /* 真正的输入区：富文本 iframe 的 body 优先，隐藏 textarea 只是 UEditor 的原元素 */
+        const rich = richEditorOf(el);
+        const blanks = this.blankTargets(el, rich);
+
+        /* 题干图片 + 每个选项的图片：公式/示意图常常只有图，没有文字 */
+        const images = stemImagesOf(el, Q_SELECTORS.option);
+        const optionImages = {};
+        for (const o of parsed) if (o.img) optionImages[o.key] = o.img;
 
         /* 题型：优先读容器自带的 typename（新版作业页 div.questionLi[typename="多选题"]）， */
         let typeHint = '';
@@ -6236,7 +6269,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         else {
           try {
             if (el.querySelector('input[type="checkbox"]')) type = 'multi';
-            else if (!el.querySelector('input[type="radio"]') && !options.length) type = 'blank';
+            /* 判「没选项 = 填空」必须用**未过滤**的选项元素数：纯图片选项的正文是空的 */
+            else if (!el.querySelector('input[type="radio"]') && !optionEls.length) type = 'blank';
           } catch (e) { /* 忽略 */ }
         }
 
@@ -6249,13 +6283,18 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           qid,
           type,
           question: stem.replace(/\s+/g, ' ').trim(),
-          options: options.map(({ key, text }) => ({ key, text })),
+          options: options.map((o) => (o.img
+            ? { key: o.key, text: o.text || '(图片选项)', image: true }
+            : { key: o.key, text: o.text })),
           sig,
           el,
           optionEls: options.map((o) => o.el),
           allOptionEls: optionEls,      // 未过滤：判断题等按位置取元素时用
           optionByKey,                  // 字母 → 元素，不受过滤影响
           blankEls: blanks,
+          editor: rich && rich.body ? 'ueditor' : '',
+          images,          // 题干图片（绝对地址）
+          optionImages,    // 选项字母 → 图片地址
         };
       }).filter((q) => q && q.question);
     },
@@ -6364,8 +6403,18 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       }
 
       // 4) 填空 / 简答（含 UEditor 富文本）
+      /* 富文本 iframe 里的内容才是真答案：藏起来的 textarea 可能被写过、页面上却什么都没有 */
+      const richBox = richEditorOf(el);
+      if (richBox && richBox.body) {
+        out.detectable = true;
+        if (String(richBox.body.textContent || '').replace(/[\u200b\s]/g, '')) {
+          out.answered = true;
+          out.how = '富文本编辑器有内容';
+          return out;
+        }
+      }
       let blanks = [];
-      try { blanks = this.pickAll(el, Q_SELECTORS.blank); } catch (e) { blanks = []; }
+      try { blanks = this.blankTargets(el, richBox); } catch (e) { blanks = []; }
       if (blanks.length) out.detectable = true;
       for (const b of blanks) {
         try {
@@ -6504,26 +6553,70 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         return this.fallback(questions);
       }
 
-      const payload = questions.map((q) => ({
-        id: q.id,
-        type: q.type,
-        question: q.question,
-        options: q.options,
-      }));
-
       const system = String(CONFIG.promptTemplate || '').trim() || DEFAULT_PROMPT;
       const headers = { 'Content-Type': 'application/json' };
       if (CONFIG.apiKey) headers.Authorization = 'Bearer ' + String(CONFIG.apiKey).trim();
 
-      const body = JSON.stringify({
-        model: CONFIG.apiModel || 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: '题目如下（JSON 数组）：\n' + JSON.stringify(payload) },
-        ],
-        temperature: 0.2,   // 答题要的是稳定复现，不是创造力
-        stream: false,
-      });
+      /* 题干/选项里的图片：模型看不到就等于题目缺条件（超星把公式渲染成 <img>） */
+      const images = [];
+      if (CONFIG.sendImages !== false && !this.imageOff) {
+        for (const q of questions) {
+          for (const url of (q.images || [])) images.push({ tag: `${q.id} 题干图片`, url });
+          for (const key of Object.keys(q.optionImages || {})) {
+            images.push({ tag: `${q.id} 选项 ${key} 图片`, url: q.optionImages[key] });
+          }
+        }
+      }
+      if (images.length > MAX_IMAGES_PER_REQUEST) {
+        warn(`本批题目共 ${images.length} 张图片，超过单次上限 ${MAX_IMAGES_PER_REQUEST} 张：只带前 ${MAX_IMAGES_PER_REQUEST} 张，其余按纯文本作答`);
+        images.length = MAX_IMAGES_PER_REQUEST;
+      }
+
+      /* 图片两条路：填了「视觉模型」就先把图转成文字（主模型可以是纯文本）；没填就直接把图带给主模型 */
+      const visionModel = String(CONFIG.visionModel || '').trim();
+      let imageNotes = {};
+      const imageParts = [];
+      if (images.length && visionModel) {
+        log(`图片转写: ${visionModel} · ${images.length} 张`);
+        imageNotes = await this.describeImages(questions, visionModel);
+      } else if (images.length) {
+        /* 内联成 data: URL：超星图床对非浏览器客户端返回 403，模型端自己抓不到 */
+        for (const it of images) {
+          const dataUrl = await this.inlineImage(it.url);
+          imageParts.push({ tag: it.tag, url: dataUrl || it.url });
+          if (!dataUrl) warn(`题目图片取不到（${it.tag}）：这一题可能缺条件，建议检查「发送题目图片」或手动补答`);
+        }
+      }
+
+      const buildPayload = (notes) => questions.map((q) => ({
+        id: q.id,
+        type: q.type,
+        question: (q.question || '') + (notes && notes[q.id] ? '\n[图片转写内容]\n' + notes[q.id] : ''),
+        options: (q.options || []).map((o) => (o.image ? { key: o.key, text: o.text || '', image: true } : { key: o.key, text: o.text })),
+      }));
+
+      /* withImages=true 时用 OpenAI 视觉格式：文本片段 + [标签] + image_url */
+      const buildBody = (withImages) => {
+        const intro = '题目如下（JSON 数组）：\n' + JSON.stringify(buildPayload(imageNotes)) +
+          (withImages ? '\n题干/选项的图片按下面 [标签] 的顺序附在本消息里，请结合图片内容作答。' : '');
+        let content = intro;
+        if (withImages) {
+          content = [{ type: 'text', text: intro }];
+          for (const it of imageParts) {
+            content.push({ type: 'text', text: `[${it.tag}]` });
+            content.push({ type: 'image_url', image_url: { url: it.url } });
+          }
+        }
+        return JSON.stringify({
+          model: CONFIG.apiModel || 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content },
+          ],
+          temperature: 0.2,   // 答题要的是稳定复现，不是创造力
+          stream: false,
+        });
+      };
 
       /* 密钥为空时：照发，但**不重试**。 */
       const noKey = !CONFIG.apiKey;
@@ -6531,23 +6624,58 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         warn('AI 模式密钥为空：接口不需要密钥（本地模型/密钥写在地址里）可忽略，否则本次请求多半被拒且不重试');
       }
 
-      log(`答题 API（AI 模式）: ${endpoint} · ${CONFIG.apiModel || '默认模型'} · 密钥 ${noKey ? '未填' : `已填（${String(CONFIG.apiKey).length} 字符）`}`);
-      let res;
+      const noteCount = Object.keys(imageNotes).length;
+      let usedImages = imageParts.length > 0;
+      log(`答题 API（AI 模式）: ${endpoint} · ${CONFIG.apiModel || '默认模型'} · 密钥 ${noKey ? '未填' : `已填（${String(CONFIG.apiKey).length} 字符）`}` +
+          (usedImages ? ` · 附图片 ${imageParts.length} 张（已内联）` : '') +
+          (noteCount ? ` · 图片转写 ${noteCount} 题` : ''));
+
+      const send = (withImages) => this.callApi('ai', endpoint, {
+        url: endpoint,
+        method: 'POST',
+        headers,
+        data: buildBody(withImages),
+        timeout: CONFIG.apiTimeout,
+      }, noKey ? 0 : undefined);   // 0 = 不重试（总尝试次数 1）
+
+      let res = null;
       try {
-        res = await this.callApi('ai', endpoint, {
-          url: endpoint,
-          method: 'POST',
-          headers,
-          data: body,
-          timeout: CONFIG.apiTimeout,
-        }, noKey ? 0 : undefined);   // 0 = 不重试（总尝试次数 1）
+        res = await send(usedImages);
       } catch (e) {
-        warn('答题 API 调用失败:', this.explainApiError(e, endpoint));
-        return this.fallback(questions);
+        if (!usedImages) {
+          warn('答题 API 调用失败:', this.explainApiError(e, endpoint));
+          return this.fallback(questions);
+        }
+        warn('带图片的请求失败（模型/网关多半不支持视觉）:', this.explainApiError(e, endpoint));
+        warn('  已自动退回纯文本重试；想彻底不发图片，取消勾选「发送题目图片」');
+        this.imageOff = true;
+        usedImages = false;
+        try {
+          res = await send(false);
+        } catch (e2) {
+          warn('答题 API 调用失败:', this.explainApiError(e2, endpoint));
+          return this.fallback(questions);
+        }
       }
 
       let json = null;
       try { json = JSON.parse(res.responseText); } catch (e) { /* 不是 JSON 就走纯文本解析 */ }
+
+      /* 网关用 200 + {"error":…} 拒绝视觉请求的情况也要退回纯文本，否则整页一题都答不出 */
+      if (usedImages && json && json.error) {
+        warn('网关拒绝了带图片的请求:', JSON.stringify(json.error).slice(0, 200));
+        warn('  已自动退回纯文本重试（本页后续请求不再带图）');
+        this.imageOff = true;
+        usedImages = false;
+        try {
+          res = await send(false);
+          try { json = JSON.parse(res.responseText); } catch (e) { json = null; }
+        } catch (e2) {
+          warn('答题 API 调用失败:', this.explainApiError(e2, endpoint));
+          return this.fallback(questions);
+        }
+      }
+
       const text = json ? pickModelText(json) : String(res.responseText || '');
 
       if (!text) {
@@ -6749,6 +6877,73 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       return ok;
     },
 
+    /* 用视觉模型把题干/选项图片转成文字（主模型是纯文本时靠它，图片题才不会缺条件） */
+    async describeImages(questions, model) {
+      const endpoint = resolveChatEndpoint(CONFIG.apiUrl, CONFIG.apiUrlFull);
+      const headers = { 'Content-Type': 'application/json' };
+      if (CONFIG.apiKey) headers.Authorization = 'Bearer ' + String(CONFIG.apiKey).trim();
+      const notes = {};
+
+      for (const q of questions) {
+        const items = [];
+        for (const url of (q.images || [])) items.push({ tag: '题干图片', url });
+        for (const key of Object.keys(q.optionImages || {})) items.push({ tag: `选项 ${key} 图片`, url: q.optionImages[key] });
+        if (!items.length) continue;
+
+        const parts = [{
+          type: 'text',
+          text: '把下面这些图片里的内容**原样**转成文字：数学公式用 LaTeX（$...$），图形/表格用一句话说明要点。只输出转写结果，不要解题，不要编号，不要解释。',
+        }];
+        for (const it of items) {
+          const dataUrl = await this.inlineImage(it.url);
+          if (!dataUrl) continue;
+          parts.push({ type: 'text', text: `[${it.tag}]` });
+          parts.push({ type: 'image_url', image_url: { url: dataUrl } });
+        }
+        if (parts.length < 2) continue;
+
+        try {
+          const res = await this.callApi('vision', endpoint, {
+            url: endpoint,
+            method: 'POST',
+            headers,
+            data: JSON.stringify({ model, messages: [{ role: 'user', content: parts }], temperature: 0, stream: false }),
+            timeout: CONFIG.apiTimeout,
+          }, 0);
+          let json = null;
+          try { json = JSON.parse(res.responseText); } catch (e) { json = null; }
+          const text = json ? pickModelText(json) : String(res.responseText || '');
+          if (text && text.trim()) notes[q.id] = text.trim().slice(0, 1500);
+          else warn(`图片转写没有返回内容（${q.id}），这一题按纯文本作答`);
+        } catch (e) {
+          warn(`图片转写失败（${q.id}）：` + this.explainApiError(e, endpoint));
+          warn('  已跳过剩余图片转写，本次按纯文本作答；把「视觉模型」换成支持图片的模型可解决');
+          this.imageOff = true;
+          break;
+        }
+      }
+      return notes;
+    },
+
+    /* 题目图片内联：同一张图在一次会话里只抓一次（逐题模式会重复问同一题） */
+    async inlineImage(url) {
+      if (!url) return '';
+      if (/^data:/i.test(url)) return url;
+      if (!this.imgCache) this.imgCache = new Map();
+      if (this.imgCache.has(url)) return this.imgCache.get(url);
+      const dataUrl = await fetchImageDataUrl(url);
+      if (dataUrl) {
+        if (this.imgCache.size > 60) this.imgCache.clear();
+        this.imgCache.set(url, dataUrl);
+      }
+      return dataUrl;
+    },
+
+    /* 这道题真正的可输入元素：富文本 body 优先，其次可见输入框，最后才退回隐藏 textarea */
+    blankTargets(el, rich) {
+      return pickBlankTargets(el, rich);
+    },
+
     /* 把一道题的答案解析成「要操作的元素」，**不产生任何副作用**。 */
     resolveTargets(q, ans) {
       const A = String(ans == null ? '' : ans).trim();
@@ -6809,9 +7004,19 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       // 填空 / 简答：按分隔符拆成多空
       if (r.kind === 'blank') {
         const parts = A.split(/\s*[|｜;；]\s*/);
+        /* 只有一个输入区（简答 / 计算题的富文本）时不能按 | 拆：那是多问答案，拆开会丢掉后一半 */
+        const single = r.targets.length === 1;
         r.targets.forEach((el, i) => {
-          const val = parts[i] ?? parts[0] ?? A;
-          if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+          const val = single
+            ? (parts.length > 1 ? parts.join('\n') : A)
+            : (parts[i] ?? parts[0] ?? A);
+          const tag = String(el.tagName || '').toUpperCase();
+          /* UEditor 的可编辑区在 iframe 的 body 里：只写 textarea 页面什么都不显示 */
+          if (tag === 'BODY' || (el.isContentEditable && tag !== 'TEXTAREA' && tag !== 'INPUT')) {
+            const html = setRichText(el, plainAnswerText(val));
+            ueditorSetContent(el, html);
+            syncHiddenAnswerField(q.el, html);
+          } else if (tag === 'TEXTAREA' || tag === 'INPUT') {
             setNativeValue(el, val);
           } else {
             el.textContent = val;
@@ -7131,6 +7336,255 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
   }
+
+  /* ==== UEditor 回填 BEGIN（bench/ueditor-fill-test.js 会原样提取这一段来测）==== */
+  /* 元素是否被隐藏：UEditor 的原 textarea 是 display:none，写进去用户看不见 */
+  function isHiddenField(el) {
+    try {
+      if (!el) return true;
+      if (el.hidden) return true;
+      const doc = el.ownerDocument || document;
+      const win = doc.defaultView || window;
+      const st = win.getComputedStyle ? win.getComputedStyle(el) : null;
+      if (st && (st.display === 'none' || st.visibility === 'hidden')) return true;
+      if (el.getClientRects && !el.getClientRects().length && el.offsetParent === null) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  /* 富文本编辑器（UEditor）：可编辑区在 iframe 的 body 里，外层只有工具条 */
+  function richEditorOf(el) {
+    if (!el || !el.querySelector) return null;
+    let iframe = null;
+    try { iframe = el.querySelector('iframe[id^="ueditor_"]') || el.querySelector('.edui-editor iframe'); } catch (e) { iframe = null; }
+    if (!iframe) return null;
+    let body = null;
+    try { body = iframe.contentDocument ? iframe.contentDocument.body : null; } catch (e) { body = null; }
+    return { iframe, body };
+  }
+
+  /* 模型常把数学答案写成 LaTeX（\frac{1}{2}）；编辑器里显示原文很丑，做一次保守的纯文本化 */
+  function plainAnswerText(s) {
+    let t = String(s == null ? '' : s);
+    t = t.replace(/\$+([^$]*)\$+/g, '$1');
+    t = t.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '($1)/($2)');
+    t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, '√($1)');
+    t = t.replace(/\\(?:left|right|displaystyle|quad|qquad|,|;|!)/g, '');
+    t = t.replace(/\\cdot/g, '·').replace(/\\times/g, '×').replace(/\\div/g, '÷');
+    t = t.replace(/\\pi/g, 'π').replace(/\\infty/g, '∞');
+    t = t.replace(/\\leq|\\le/g, '≤').replace(/\\geq|\\ge/g, '≥').replace(/\\neq|\\ne/g, '≠');
+    t = t.replace(/\^\{([^{}]*)\}/g, '^$1').replace(/_\{([^{}]*)\}/g, '_$1');
+    t = t.replace(/\\([a-zA-Z]+)/g, '$1');
+    return t.trim();
+  }
+
+  /* 这道题真正的可输入元素：富文本 body 优先，其次可见输入框，最后才退回隐藏 textarea */
+  function pickBlankTargets(el, rich) {
+    const box = rich || richEditorOf(el);
+    const out = [];
+    if (box && box.body) out.push(box.body);
+
+    let cands = [];
+    try { cands = Array.from(el.querySelectorAll(Q_SELECTORS.blank.join(','))); } catch (e) { cands = []; }
+
+    const hidden = [];
+    for (const c of cands) {
+      if (box && box.body === c) continue;
+      try { if (box && box.iframe && box.iframe.parentElement && box.iframe.parentElement.contains(c)) continue; } catch (e) { /* 忽略 */ }
+      if (isHiddenField(c)) { hidden.push(c); continue; }
+      out.push(c);
+    }
+    return out.length ? out : hidden;
+  }
+
+  /* 写进 UEditor 的 iframe body —— 它的 getContent() 直接读这个 DOM，页面立刻就能看到 */
+  function setRichText(bodyEl, text) {
+    const doc = bodyEl.ownerDocument;
+    const win = (doc && doc.defaultView) || window;
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = String(text == null ? '' : text)
+      .replace(/\r/g, '')
+      .split('\n')
+      .map((line) => '<p>' + (esc(line) || '<br>') + '</p>')
+      .join('');
+    try { bodyEl.focus(); } catch (e) { /* 忽略 */ }
+    try { bodyEl.innerHTML = html; } catch (e) { bodyEl.textContent = String(text || ''); }
+    for (const t of ['input', 'keyup', 'change', 'blur']) {
+      try { bodyEl.dispatchEvent(new win.Event(t, { bubbles: true })); } catch (e) { /* 忽略 */ }
+    }
+    return html;
+  }
+
+  /* 顺手调一次页面自己的 UEditor 实例（沙箱里未必拿得到，拿不到就只靠上面的 DOM 写入） */
+  function ueditorSetContent(bodyEl, html) {
+    try {
+      const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : (window.wrappedJSObject || null);
+      const UE = w && w.UE;
+      if (!UE || !UE.instants) return false;
+      for (const k of Object.keys(UE.instants)) {
+        const ed = UE.instants[k];
+        if (!ed) continue;
+        let same = false;
+        try { same = !!ed.iframe && ed.iframe.contentDocument === bodyEl.ownerDocument; } catch (e) { same = false; }
+        if (!same) continue;
+        try { ed.setContent(html, false); } catch (e) { /* 忽略 */ }
+        try { if (typeof ed.sync === 'function') ed.sync(); } catch (e) { /* 忽略 */ }
+        return true;
+      }
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  /* UEditor 提交时会用编辑器内容覆盖隐藏 textarea；先把 textarea 也写一遍，两条提交路径都通 */
+  function syncHiddenAnswerField(qEl, html) {
+    try {
+      if (!qEl || !qEl.querySelector) return false;
+      const ta = qEl.querySelector('textarea[name^="answer"], textarea[id^="answer"]');
+      if (!ta) return false;
+      setNativeValue(ta, html);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* ==== UEditor 回填 END ==== */
+
+  /* ==== 题目图片 BEGIN（bench/question-image-test.js 会原样提取这一段来测）==== */
+
+  /* 一道题最多带几张图：整页几十道题全带图会把请求体和 token 撑爆 */
+  const MAX_IMAGES_PER_QUESTION = 6;
+  /* 单次请求最多带 12 张：整卷模式下几十道题 × 6 张会把请求体和 token 撑爆 */
+  const MAX_IMAGES_PER_REQUEST = 12;
+
+  /* 图片的真实地址：懒加载时 src 常是占位图，真地址在 data-src / data-original 上 */
+  function imgUrlOf(img) {
+    try {
+      if (!img) return '';
+      const raw = img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') ||
+                  img.getAttribute('data-original') || img.getAttribute('data-lazy-src') || '';
+      if (!raw) return '';
+      if (/^data:image\//i.test(raw)) return raw;
+      if (/^blob:|^javascript:/i.test(raw)) return '';
+      const base = (img.ownerDocument && img.ownerDocument.baseURI) ||
+                   (typeof location !== 'undefined' ? location.href : '');
+      const abs = new URL(raw, base).href;
+      return /^https?:/i.test(abs) ? abs : '';
+    } catch (e) { return ''; }
+  }
+
+  /* 太小的图（图标、占位、1px 分隔线）没有信息量，发了只浪费 token */
+  function isUsefulImage(img) {
+    try {
+      if (!img || !imgUrlOf(img)) return false;
+      const w = Number(img.naturalWidth) || 0;
+      const h = Number(img.naturalHeight) || 0;
+      if (w && h && w < 16 && h < 16) return false;
+      const cls = String(img.className || '');
+      if (/(^|[\s_-])(icon|emoji|avatar|logo|loading|placeholder)([\s_-]|$)/i.test(cls)) return false;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* 题干里的图片：选项行里的图不算（它们按选项单独发） */
+  function stemImagesOf(rootEl, optionSelectors) {
+    const out = [];
+    if (!rootEl) return out;
+    let imgs = [];
+    try { imgs = Array.from(rootEl.querySelectorAll('img')); } catch (e) { imgs = []; }
+    const optSel = (optionSelectors || []).join(',');
+    for (const img of imgs) {
+      let inOption = false;
+      try {
+        const row = optSel && img.closest ? img.closest(optSel) : null;
+        inOption = !!(row && row !== rootEl && rootEl.contains(row));
+      } catch (e) { inOption = false; }
+      if (inOption) continue;
+      if (!isUsefulImage(img)) continue;
+      const url = imgUrlOf(img);
+      if (url && out.indexOf(url) < 0) out.push(url);
+      if (out.length >= MAX_IMAGES_PER_QUESTION) break;
+    }
+    return out;
+  }
+
+  /* 一张图最多 2MB：再大的基本不是公式图，内联进请求只会把 token 和带宽撑爆 */
+  const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+
+  /* Blob → data: URL（模型端拿不到带登录态的图，只能把字节塞进请求里） */
+  function blobToDataUrl(blob) {
+    return new Promise((resolve) => {
+      try {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result || ''));
+        fr.onerror = () => resolve('');
+        fr.readAsDataURL(blob);
+      } catch (e) { resolve(''); }
+    });
+  }
+
+  /* 取图片字节并转成 data: URL：先走 fetch（超星图床允许匿名跨域），被拦再走 GM_xmlhttpRequest */
+  async function fetchImageDataUrl(url) {
+    if (!url) return '';
+    if (/^data:/i.test(url)) return url;
+    try {
+      const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
+      if (res && res.ok) {
+        const blob = await res.blob();
+        if (blob && blob.size && blob.size <= MAX_IMAGE_BYTES) return await blobToDataUrl(blob);
+      }
+    } catch (e) { /* 跨域被拒 → 走 GM */ }
+
+    /* GM_xmlhttpRequest 不受 CORS 限制，也能带登录态，是最后一道保险 */
+    return await new Promise((resolve) => {
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          responseType: 'arraybuffer',
+          timeout: 15000,
+          onload: (res) => {
+            try {
+              const buf = res && res.response;
+              if (!res || res.status !== 200 || !buf) return resolve('');
+              const bytes = new Uint8Array(buf);
+              if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) return resolve('');
+              let bin = '';
+              const CHUNK = 0x8000;
+              for (let i = 0; i < bytes.length; i += CHUNK) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+              }
+              /* 从响应头里读 MIME：GM 给的是原始头文本，按行切再取 content-type 的值 */
+              const NL = String.fromCharCode(10);
+              const CR = String.fromCharCode(13);
+              const lines = String(res.responseHeaders || '').split(NL);
+              let type = 'image/png';
+              for (let li = 0; li < lines.length; li++) {
+                const line = lines[li].split(CR).join('');
+                const p = line.toLowerCase().indexOf('content-type:');
+                if (p < 0) continue;
+                if (p > 0 && line.slice(0, p).trim() !== '') continue;
+                const v = line.slice(p + 'content-type:'.length).split(';')[0].trim();
+                if (v) type = v;
+                break;
+              }
+              resolve('data:' + type + ';base64,' + btoa(bin));
+            } catch (e) { resolve(''); }
+          },
+          onerror: () => resolve(''),
+          ontimeout: () => resolve(''),
+        });
+      } catch (e) { resolve(''); }
+    });
+  }
+
+  /* 单个选项里的第一张图（纯图片选项靠它才有内容） */
+  function optionImageOf(optionEl) {
+    if (!optionEl) return '';
+    let imgs = [];
+    try { imgs = Array.from(optionEl.querySelectorAll('img')); } catch (e) { imgs = []; }
+    for (const img of imgs) if (isUsefulImage(img)) return imgUrlOf(img);
+    return '';
+  }
+  /* ==== 题目图片 END ==== */
 
   /* 6. 文档 / PPT 阅读模块 */
 
@@ -7505,6 +7959,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           <h4>答题 <span class="badge" id="modeBadge">${c.apiMode === 'custom' ? '自定义接口' : 'AI 直连'}</span></h4>
           <div class="row"><span>启用</span><input type="checkbox" id="answerEnabled" ${c.answerEnabled ? 'checked' : ''}></div>
           <div class="row"><span>题旁显示进度</span><input type="checkbox" id="showProgress" ${c.showProgress ? 'checked' : ''}></div>
+          <div class="row"><span>发送题目图片</span><input type="checkbox" id="sendImages" ${c.sendImages !== false ? 'checked' : ''}></div>
+          <p class="tip">题干/选项里的图片（超星把公式渲染成图片，纯图片选项更是只有图）会一起发给模型，<b>需要模型支持视觉</b>；网关拒绝时脚本会自动退回纯文本重试，不会因此一题都不答。</p>
           <div class="row"><span>作答方式</span>
             <select id="answerMode">
               <option value="per" ${c.answerMode !== 'batch' ? 'selected' : ''}>逐题作答（推荐）</option>
@@ -7525,6 +7981,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
             <div class="row"><span>API 地址</span><input type="text" id="apiUrl" value="${esc(c.apiUrl)}" placeholder="https://api.openai.com/v1"></div>
             <div class="row"><span>API 密钥</span><input type="password" id="apiKey" value="${esc(c.apiKey)}" placeholder="sk-..."></div>
             <div class="row"><span>模型</span><input type="text" id="apiModel" value="${esc(c.apiModel)}" placeholder="gpt-4o-mini"></div>
+            <div class="row"><span>视觉模型</span><input type="text" id="visionModel" value="${esc(c.visionModel || '')}" placeholder="留空=主模型带图"></div>
+            <p class="tip">题干/选项里的图片（超星把公式渲染成图片，纯图片选项更是只有图）：<b>留空</b>就把图片直接附给上面的主模型（主模型必须支持视觉）；<b>填一个视觉模型名</b>（如 <code>gpt-4o</code> / <code>qwen-vl-max</code>）则先用它把图片转成文字，再交给主模型作答 —— 主模型是纯文本时用这个。接口拒绝时脚本会自动退回纯文本，不会一题都不答。</p>
             <div class="row" style="display:block">
               <span style="display:block;margin-bottom:4px">系统提示词 <a class="lnk" id="btnResetPrompt">恢复默认</a></span>
               <textarea id="promptTemplate" class="tall">${esc(c.promptTemplate)}</textarea>
@@ -7623,6 +8081,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       bindToggle('docEnabled', 'docEnabled');
       bindToggle('answerEnabled', 'answerEnabled');
       bindToggle('showProgress', 'showProgress');
+      bindToggle('sendImages', 'sendImages');
       bindToggle('dryRun', 'dryRun');
       bindToggle('autoSubmit', 'autoSubmit');
       // 考试交卷开关独立于 autoSubmit（考试被直接交卷是高风险动作，默认关；作业行为不变）
@@ -7688,6 +8147,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         apiUrl: $('apiUrl').value.trim(),
         apiKey: $('apiKey').value.trim(),
         apiModel: $('apiModel').value.trim(),
+        visionModel: $('visionModel').value.trim(),
         apiUrlFull: $('apiUrlFull').checked,
         promptTemplate: $('promptTemplate').value,
         apiUrlCustom: $('apiUrlCustom').value.trim(),
@@ -7701,6 +8161,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         answerMode: $('answerMode').value,
         answerRetries: Math.max(0, Math.min(5, Number($('answerRetries').value) || 0)),
         dryRun: $('dryRun').checked,
+        sendImages: $('sendImages').checked,
         videoJumpToEnd: $('videoJumpToEnd').checked,
         videoJumpMinProgress: Math.max(0, Math.min(600, Number($('videoJumpMinProgress').value) || 0)),
         completeSelectors: $('completeSelectors').value.trim(),
