@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.9.7
+// @version      1.9.8
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -152,7 +152,7 @@
     } catch (e) { return 'p?'; }
   })();
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改， */
-  const SCRIPT_VERSION = '1.9.7';
+  const SCRIPT_VERSION = '1.9.8';
   /* 版本变了就清空旧日志缓冲：旧版本写的行没有分组标记，面板没法判断它属于哪个页面。 */
   try {
     const LOG_VERSION_KEY = 'cx_auto_logver';
@@ -5514,6 +5514,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
            `${mapped && mapped !== letters ? ` ⚠映射=${mapped}(与字母不一致)` : ''}` +
            ` 填空元素=${(q.blankEls || []).length}${blankTags ? `(${blankTags})` : ''}` +
            ` 图片=${(q.images || []).length}/${Object.keys(q.optionImages || {}).length}` +
+           ` 公式=${q.latex || 0}` +
            ` 题干="${String(q.question || '').slice(0, 30)}"` +
            `${opts.length ? `\n      选项明细: ${optTxt}` : ''}`;
   }
@@ -6214,12 +6215,18 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           return null;
         }
 
-        const stem = dec(this.pickText(el, Q_SELECTORS.stem) || '');
+        /* 题干：把公式图换成 LaTeX 原文，公式才会落在句子里该在的位置 */
+        const stemEl = this.stemElementOf(el);
+        let latexCount = 0;
+        try {
+          latexCount = stemEl ? Array.from(stemEl.querySelectorAll('img')).filter((im) => !!latexFromImg(im)).length : 0;
+        } catch (e) { latexCount = 0; }
+        const stem = stemEl ? textWithLatex(stemEl, dec) : dec(this.pickText(el, Q_SELECTORS.stem) || '');
         const optionEls = this.pickAll(el, Q_SELECTORS.option);
 
         // 解析每个选项行的「字母 + 正文」。字母优先读超星的 data 属性，比从文本里抠可靠。
         const parsed = optionEls.map((o, i) => {
-          const raw = dec((o.textContent || '').replace(/\s+/g, ' ').trim());
+          const raw = textWithLatex(o, dec);
           let key = '';
           try {
             const lab = o.querySelector('.num_option, .num_option_dx, [data]');
@@ -6293,6 +6300,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           optionByKey,                  // 字母 → 元素，不受过滤影响
           blankEls: blanks,
           editor: rich && rich.body ? 'ueditor' : '',
+          latex: latexCount,   // 题干里被转成 LaTeX 的公式图数量
           images,          // 题干图片（绝对地址）
           optionImages,    // 选项字母 → 图片地址
         };
@@ -6939,6 +6947,19 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       return dataUrl;
     },
 
+    /* 题干元素：先找有文字的，实在没有（整题只有图）再用第一个命中的 */
+    stemElementOf(el) {
+      for (const sel of Q_SELECTORS.stem) {
+        let n = null;
+        try { n = el.querySelector(sel); } catch (e) { n = null; }
+        if (n && String(n.textContent || '').trim()) return n;
+      }
+      for (const sel of Q_SELECTORS.stem) {
+        try { const n = el.querySelector(sel); if (n) return n; } catch (e) { /* 忽略 */ }
+      }
+      return el;
+    },
+
     /* 这道题真正的可输入元素：富文本 body 优先，其次可见输入框，最后才退回隐藏 textarea */
     blankTargets(el, rich) {
       return pickBlankTargets(el, rich);
@@ -7475,6 +7496,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
   function isUsefulImage(img) {
     try {
       if (!img || !imgUrlOf(img)) return false;
+      if (latexFromImg(img)) return false;   // 公式图已经转成 LaTeX 文本，不用再发图
       const w = Number(img.naturalWidth) || 0;
       const h = Number(img.naturalHeight) || 0;
       if (w && h && w < 16 && h < 16) return false;
@@ -7482,6 +7504,50 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (/(^|[\s_-])(icon|emoji|avatar|logo|loading|placeholder)([\s_-]|$)/i.test(cls)) return false;
       return true;
     } catch (e) { return false; }
+  }
+
+  /* 超星把公式渲染成 <img class="ans-latex-moudle" data="URL 编码的 LaTeX">：
+     直接从 data 里取原文，比让模型看图更准，请求也小得多 */
+  function latexFromImg(img) {
+    try {
+      const raw = (img && img.getAttribute)
+        ? (img.getAttribute('data') || img.getAttribute('data-latex') || '')
+        : '';
+      if (!raw) return '';
+      let s = raw;
+      try { s = decodeURIComponent(s); } catch (e) { /* 已经是明文，直接用 */ }
+      s = String(s).trim();
+      if (s.length > 1 && (s.charAt(0) === '"' || s.charAt(0) === "'") && s.charAt(s.length - 1) === s.charAt(0)) {
+        s = s.slice(1, -1);
+      }
+      /* 编码层把反斜杠写了一倍：\\frac → \frac（\\ 行分隔符本来就该是两个，这里只折一半） */
+      s = s.replace(/\\\\/g, '\\');
+      return s.trim();
+    } catch (e) { return ''; }
+  }
+
+  /* 把容器里的 <img> 换成它的 LaTeX 原文：公式才会落在句子里原本的位置，而不是被丢在句尾 */
+  function textWithLatex(rootEl, decodeText) {
+    if (!rootEl) return '';
+    const dec = typeof decodeText === 'function' ? decodeText : ((s) => s);
+    let out = '';
+    const walk = (node) => {
+      if (!node) return;
+      if (node.nodeType === 3) { out += node.nodeValue; return; }
+      if (node.nodeType !== 1) return;
+      const tag = String(node.tagName || '').toUpperCase();
+      if (tag === 'IMG') {
+        const tex = latexFromImg(node);
+        out += tex ? (' $' + tex + '$ ') : ' ';
+        return;
+      }
+      if (tag === 'BR') { out += ' '; return; }
+      if (tag === 'SCRIPT' || tag === 'STYLE') return;
+      const kids = Array.from(node.childNodes || []);
+      for (const c of kids) walk(c);
+    };
+    walk(rootEl);
+    return dec(out).replace(/\s+/g, ' ').trim();
   }
 
   /* 题干里的图片：选项行里的图不算（它们按选项单独发） */
