@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      1.9.8
+// @version      2.0.0
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -132,6 +132,8 @@
     submitConfirm: false,      // 提交前是否弹确认（手动模式用）
     submitWaitMs: 20000,       // 提交后等待"提交成功"确认的最长时间
     fallbackAnswer: '',        // API 无结果时的兜底答案，如 "A"，留空则跳过该题
+  /* 分页答题（考试/测验一页一题）：答完当前这一页后自动点「下一题」。关掉就只答当前页。 */
+    pagedAutoNext: true,
 
     // ---- 其它 ----
     debug: false,              // 输出 console 日志。排查问题时再打开
@@ -152,7 +154,7 @@
     } catch (e) { return 'p?'; }
   })();
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改， */
-  const SCRIPT_VERSION = '1.9.8';
+  const SCRIPT_VERSION = '2.0.0';
   /* 版本变了就清空旧日志缓冲：旧版本写的行没有分组标记，面板没法判断它属于哪个页面。 */
   try {
     const LOG_VERSION_KEY = 'cx_auto_logver';
@@ -173,6 +175,10 @@
 
   /* 「本任务点已经点过提交」的持久记录（谁点的都算：脚本或用户自己）。 */
   const EVT_SUBMITTED = 'cx_auto_submit_latch';
+
+  /* 「本页全部重新作答」信号：面板（顶层）→ 所有 frame。
+     题目在子 frame 里，顶层直接调 WorkModule 是空炮，必须广播。 */
+  const EVT_REDO_ALL = 'cx_auto_redo_all';
 
   /* 能唯一定位"一个任务点"的 URL 参数。 */
   const TASK_KEY_PARAMS = [
@@ -1125,6 +1131,40 @@
     } catch (e) { warn('广播失败', e); }
     // GM_addValueChangeListener 不会在发起方自身触发，所以本地要自己跑一遍
     doRetryLocal(at);
+  }
+
+  /* 面板（顶层）调用：请所有 frame 把本页已作答的题清空重答 */
+  let lastRedoAllAt = 0;
+  function requestRedoAll() {
+    const at = Date.now();
+    try { GM_setValue(EVT_REDO_ALL, { at }); } catch (e) { warn('广播「全部重新作答」失败', e); }
+    // 广播不会在发起方自身触发，本地自己跑一遍
+    doRedoAllLocal(at);
+  }
+
+  /* 本 frame 执行「全部重新作答」：清空每道已作答的题并让脚本重答。 */
+  function doRedoAllLocal(at) {
+    if (!at || at === lastRedoAllAt) return;
+    lastRedoAllAt = at;
+    if (!CONFIG.answerEnabled) return;
+    let qs = [];
+    try { qs = WorkModule.collect(true); } catch (e) { return; }
+    let n = 0;
+    for (const q of qs) {
+      let st = null;
+      try { st = WorkModule.isAnswered(q.el); } catch (e) { st = null; }
+      if (!st || !st.answered) continue;
+      try { WorkModule.redoQuestion(q); n++; } catch (e) { /* 单题失败不影响其它 */ }
+    }
+    if (n) log(`「本页全部重新作答」：已清空 ${n} 道题`);
+  }
+
+  function registerRedoAllListener() {
+    try {
+      GM_addValueChangeListener(EVT_REDO_ALL, (_k, _o, nv) => {
+        if (nv && nv.at) doRedoAllLocal(nv.at);
+      });
+    } catch (e) { /* 部分管理器不支持，忽略 */ }
   }
 
   /* 各 frame 按自己的角色重新执行 */
@@ -2375,7 +2415,11 @@
     paperInfo: ['.infoHead', '.workTitle', '.mark_title'],
     answerCard: ['.topicNumber_list li', '[id^="answerSheet"]', '.answerCard li', '.card_item'],
     /* 分页答题（一页一题）的翻页按钮。 */
-    nextQuestion: ['#nextQuestion', '.nextQuestion', '.next_question'],
+    nextQuestion: [
+      '#nextQuestion', '.nextQuestion', '.next_question',
+      // 考试分页版：<a class="jb_btn jb_btn_92 fs14" onclick="getTheNextQuestion(1)">下一题</a>
+      '.jb_btn[onclick*="getTheNextQuestion"]', '[onclick*="getTheNextQuestion"]',
+    ],
   };
 
   /* 题目容器合并成一个选择器，用于"这个文档里有没有题"的快速判断 */
@@ -2385,7 +2429,9 @@
   const DIALOG_BTN_ANY = Q_SELECTORS.dialogBtn.join(',');
 
   /* 选项选中态：隐藏 answer 输入框之外的兜底判据（不同超星版本用 cur / selected / on 等） */
-  const OPTION_CHECKED_SEL = '.cur, .selected, .checked, .choose, .choosed, [aria-checked="true"]';
+  const OPTION_CHECKED_SEL =
+    '.cur, .selected, .checked, .choose, .choosed, .check_answer, .check_answer_dx, ' +
+    '[aria-checked="true"], [aria-pressed="true"]';
 
   /* ===== 题目容器选择 BEGIN（bench/question-containers-test.js 按标记提取这段源码）===== */
 
@@ -5426,6 +5472,9 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
   /* 每题旁的 AI 作答进度徽标 */
   const QProgress = {
     ATTR: 'data-cx-progress',
+    /* 文案节点与签名属性分开存：ATTR 只表示"这是徽标"，SIGATTR 表示"当前画的是哪一版"。 */
+    LABEL: 'data-cx-progress-label',
+    SIGATTR: 'data-cx-progress-sig',
 
     // 状态 → 配色。页面是浅色的，所以用浅底深字。
     STYLE: {
@@ -5433,6 +5482,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       ok: { bg: '#e8f8ee', fg: '#17914a', bd: '#b3e3c5' },
       fail: { bg: '#fdecec', fg: '#cf1322', bd: '#f7c0c0' },
       none: { bg: '#fff7e6', fg: '#b26a00', bd: '#ffd591' },
+      answered: { bg: '#f0f5ff', fg: '#3158a6', bd: '#c5d4f6' },
     },
 
     /* 取到（必要时创建）某道题容器上的徽标元素 */
@@ -5449,7 +5499,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     /* 设置某道题的进度：state 'asking' | 'ok' | 'fail' | 'none'，text 为显示文案。 */
-    set(el, state, text) {
+    set(el, state, text, onRedo) {
       const b = this.badge(el);
       if (!b) return;
       const s = this.STYLE[state] || this.STYLE.asking;
@@ -5469,7 +5519,37 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       put('white-space', 'nowrap');
       put('user-select', 'none');
       put('pointer-events', 'none');   // 别挡住题目本身的点击
-      b.textContent = text;
+      /* 同一状态同一文案：只更新配色，不重绘子节点 —— 观察循环每几秒调一次 set()，
+         每次都重建按钮会让"正在点的按钮"在 mousedown 与 click 之间被摘掉，点了没反应。 */
+      const sig = state + '\u0001' + String(text) + '\u0001' + (onRedo ? '1' : '0');
+      if (b.getAttribute(QProgress.SIGATTR) === sig) return;
+      b.setAttribute(QProgress.SIGATTR, sig);
+      /* 文案放进<b>里，徽标元素本身只承载属性 + 样式：ATTR 是"这里是徽标"的定位属性，
+         会被 setAttribute 改成签名字，但只要不依赖它的值就无所谓（clear 用的是 [ATTR] 存在性）。 */
+      let label = b.querySelector('[' + QProgress.LABEL + ']');
+      if (!label) {
+        const doc = b.ownerDocument || document;
+        label = doc.createElement('span');
+        label.setAttribute(QProgress.LABEL, '1');
+        b.appendChild(label);
+      }
+      /* 只留一个按钮：重复 set 时先把旧的摘掉，否则每轮观察都会叠一个新按钮。 */
+      try { b.querySelectorAll('button').forEach((n) => n.remove()); } catch (e) { /* 忽略 */ }
+      label.textContent = text;
+      if (onRedo) {
+        const doc = b.ownerDocument || document;
+        const btn = doc.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '重新作答';
+        btn.title = '清除本题答案并允许脚本重新作答';
+        btn.style.cssText = 'margin-left:8px;padding:0 6px;border:1px solid currentColor;border-radius:8px;background:transparent;color:inherit;font-size:11px;line-height:16px;cursor:pointer;pointer-events:auto;';
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          try { onRedo(); } catch (e) { /* 忽略 */ }
+        });
+        b.appendChild(btn);
+      }
     },
 
     /* 清掉某道题的徽标 */
@@ -5492,6 +5572,17 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
   };
 
+  /* 已作答记录：跨刷新记住"这道题是脚本答的"，刷新后不再自动作答。 */
+  const ANSWERED_KEY = 'cx_answered_v1';
+
+  /* 记录只在同一场考试/作业内有效：任务点变了就整批作废。 */
+  const ANSWERED_TTL_MS = 6 * 60 * 60 * 1000;
+
+  /* 题面相似度用的字符集：去掉空白和标点，只留"能认出是同一道题"的字。 */
+  function normSig(s) {
+    return String(s == null ? '' : s).replace(/[\s\u200b\u00a0]/g, '').slice(0, 80);
+  }
+
   /* 把一道题**实际解析出来的样子**打印成一行：题型、解析出几个选项、字母到元素的映射、填空元素数。 */
   function describeQuestion(q) {
     if (!q) return '(题目对象为空)';
@@ -5513,6 +5604,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
            `${letters ? ` 字母=${letters}` : ''}` +
            `${mapped && mapped !== letters ? ` ⚠映射=${mapped}(与字母不一致)` : ''}` +
            ` 填空元素=${(q.blankEls || []).length}${blankTags ? `(${blankTags})` : ''}` +
+           `${(q.blankEls || []).length > 1 ? ` 多空=${(q.blankEls || []).length}` : ''}` +
            ` 图片=${(q.images || []).length}/${Object.keys(q.optionImages || {}).length}` +
            ` 公式=${q.latex || 0}` +
            ` 题干="${String(q.question || '').slice(0, 30)}"` +
@@ -5646,28 +5738,83 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       try { GM_setValue(EVT_SUBMITTED, null); } catch (e) { /* 忽略 */ }
     },
 
+    /* 有没有"用户点名要重答、且页面上确实还有颗星"的题。 */
+    hasRedoStar() {
+      try { return !!this.redoPending(); } catch (e) { return false; }
+    },
+
+    /* 用户点名「重新作答」的那道题还在页面上、且确实未作答 → 放行"已完成"闸门。
+       只放行这一道：其余题仍然不动，避免把一份已完成任务点的卷子整体重答一遍。 */
+    redoPending() {
+      if (!this.redoAt || !this.redoAt.size) return null;
+      let els = [];
+      try { els = this.findContainers(); } catch (e) { return null; }
+      for (const el of els) {
+        let sig = '';
+        try {
+          const stemEl = this.stemElementOf(el);
+          const stem = stemEl ? textWithLatex(stemEl, (s) => s) : '';
+          const qid = this.questionIdOf(el, 0);
+          sig = `${qid}::${String(stem).replace(/\s+/g, '').slice(0, 80)}`;
+        } catch (e) { continue; }
+        /* 按钮侧拿不到同一个 sig 时，退而认"这道题现在没有作答"这一条。 */
+        let st = null;
+        try { st = this.isAnswered(el); } catch (e) { st = null; }
+        if (st && st.answered) continue;
+        const asked = this.redoAt.has(sig);
+        if (asked || this.redoAt.size) {
+          if (asked) return { el, sig };
+        }
+      }
+      return null;
+    },
+
     /* 本 frame 里有没有"这个任务点已经交过了"的正向证据。 */
     doneReason() {
+      /* 「重新作答」是用户明确的反要求：页面上还有他点名要重答、且确实空着的题时，
+         "任务点已完成"不再拦人 —— 否则按钮点了没反应。 */
+      try {
+        const r = this.redoPending();
+        if (r) {
+          this.done = false;
+          this.doneWhy = '';
+          return '';
+        }
+      } catch (e) { /* 忽略 */ }
       if (this.done) return this.doneWhy;
 
+      /* 有"点名重答"的题时，第 1/2 档（完成标记 / "已提交"文案）也不拦：
+         它们描述的是**整页状态**，而用户要改的是具体一道题。 */
+      let redoOpen = false;
+      try { redoOpen = this.hasRedoStar(); } catch (e) { redoOpen = false; }
+
       // 1) 超星自己渲染的完成标记 —— 项目里最权威的信号
-      try { if (Completeness.markFound()) return '页面出现任务点完成标记'; } catch (e) { /* 忽略 */ }
+      if (!redoOpen) {
+        try { if (Completeness.markFound()) return '页面出现任务点完成标记'; } catch (e) { /* 忽略 */ }
+      }
 
       // 2) 页面上明确写着"已提交/已完成"
-      try {
-        const why = this.submittedEvidence();
-        if (why) return why;
-      } catch (e) { /* 忽略 */ }
+      if (!redoOpen) {
+        try {
+          const why = this.submittedEvidence();
+          if (why) return why;
+        } catch (e) { /* 忽略 */ }
+      }
 
       /* 3) 我们自己点过提交（跨 frame 重载 / 页面重渲染都还在）。 */
+      /*    用户点名「重新作答」的题**不拦**：他要的是把这道题重答一遍，而 latch 只说明
+            "这个任务点交过"，不说明"这道题不许再改"。其余题照旧拦着，避免整卷重答。 */
       const latch = this.submitLatch();
       if (latch) {
         const mins = Math.max(1, Math.round((Date.now() - (latch.at || 0)) / 60000));
-        if (latch.confirmed) return `本任务点已提交（${mins} 分钟前，已收到成功确认）`;
-        if (!this.paperStillOpen()) return `本任务点已点过提交、未收到成功确认（${mins} 分钟前），页面已无可作答的卷子`;
+        const redoOpen = this.hasRedoStar();
+        if (latch.confirmed && !redoOpen) return `本任务点已提交（${mins} 分钟前，已收到成功确认）`;
+        if (!this.paperStillOpen() && !redoOpen) return `本任务点已点过提交、未收到成功确认（${mins} 分钟前），页面已无可作答的卷子`;
         if (!this.latchIgnored) {
           this.latchIgnored = true;
-          warn('上次"点过提交"没拿到成功确认，但卷子仍完整地摆在页面上 → 不当作已完成，继续作答');
+          warn(redoOpen
+            ? '你点了「重新作答」：已提交记录不再拦这一道题，其余题仍不动'
+            : '上次"点过提交"没拿到成功确认，但卷子仍完整地摆在页面上 → 不当作已完成，继续作答');
         }
       }
 
@@ -5751,24 +5898,218 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     /* 分页答题（一页一题）的「下一题」。 */
     findNextQuestionButton() {
+      const ok = (n) => n && isVisible(n) && !this.isDisabled(n) && !this.isLastQuestionMarker(n);
       for (const sel of Q_SELECTORS.nextQuestion) {
         let list = [];
         try { list = Array.from(document.querySelectorAll(sel)); } catch (e) { continue; }
         for (const n of list) {
-          if (isVisible(n) && !this.isDisabled(n)) return n;
+          if (ok(n)) return n;
         }
       }
+      /* 文案兜底：扫描范围不能只看 a/button —— 超星的翻页键常是 <div class="jb_btn"> / <span onclick> 包一层文字。 */
       let nodes = [];
       try {
-        nodes = Array.from(document.querySelectorAll('a, button, div[class*="btn"], span[class*="btn"], li'));
+        nodes = Array.from(document.querySelectorAll(
+          'a, button, input[type="button"], div, span, p, li, i, strong, em'
+        ));
       } catch (e) { return null; }
+      let best = null;
       for (const n of nodes) {
         const t = buttonText(n);
-        if (!/^(下一题|下一頁|下一部分|下一组)$/.test(t)) continue;
-        if (!isVisible(n) || this.isDisabled(n)) continue;
-        return n;
+        if (!/^(下一题|下一頁|下一部分|下一组|下一道)$/.test(t)) continue;
+        if (!ok(n)) continue;
+        /* 命中的如果是外壳，翻到真正挂处理器的那一层（点击冒泡到外层无效）。 */
+        const hit = this.nextClickTargetOf(n);
+        if (!best) best = hit;
       }
-      return null;
+      return best;
+    },
+
+    /* 「下一题」按钮上真正能触发翻页的那一层：onclick 是函数 / href 非空，都没有就原样返回。 */
+    nextClickTargetOf(el) {
+      if (!el) return null;
+      const clickable = (n) => {
+        try {
+          if (typeof n.onclick === 'function') return true;
+          const h = n.getAttribute && n.getAttribute('href');
+          return !!(h && !/^javascript:(?:;|void\(0\))?$/i.test(h));
+        } catch (e) { return false; }
+      };
+      if (clickable(el)) return el;
+      let inner = [];
+      try { inner = Array.from(el.querySelectorAll('[onclick], a[href]')); } catch (e) { inner = []; }
+      for (const n of inner) {
+        if (clickable(n) && isVisible(n)) return n;
+      }
+      return el;
+    },
+
+    /* 最后一题的「下一题」是死按钮（或写着「没有下一题」）：点了没用，别拿它当"还有下一页"。 */
+    isLastQuestionMarker(el) {
+      if (!el) return false;
+      const t = buttonText(el);
+      if (/没有下一题|已是最后|最后一题|交卷$/.test(t)) return true;
+      return false;
+    },
+
+    /* 当前页这道题的唯一签名：翻页后它变化，就说明真的换题了。 */
+    pageQuestionSig() {
+      try {
+        const qs = this.collect(true);
+        if (!qs.length) return '';
+        return qs.map((q) => q.sig).join('|');
+      } catch (e) { return ''; }
+    },
+
+    /* 翻页记账：上一次点击的「下一题」、当时的题目签名、翻页次数。 */
+    pagedNav: { lastClickAt: 0, sigBefore: '', turned: 0, gaveUpSig: '', lastLogAt: 0 },
+
+    /* 点「下一题」，并返回是否真的翻到下一页（题目签名变了）。 */
+    async turnToNextQuestion(why) {
+      const sig = this.pageQuestionSig();
+      const nav = this.pagedNav;
+      const btn = this.findNextQuestionButton();
+      if (!btn) return false;
+
+      /* 熔断：翻页是最容易和页面拉锯的动作（点了没用 → 再点 → 再没用）。 */
+      if (!breaker.allow('下一题', 12, 60000)) {
+        if (Date.now() - nav.lastLogAt > 30000) {
+          nav.lastLogAt = Date.now();
+          warn('「下一题」点了太多次页面都没换题，先停手（熔断）');
+          log('  · 考点：按钮点下去没有反应，多半是它挂在别的容器上，或这一页本来就是最后一题');
+        }
+        return false;
+      }
+
+      nav.lastClickAt = Date.now();
+      nav.sigBefore = sig;
+      const target = this.nextClickTargetOf(btn);
+      log(`点「下一题」翻到第 ${nav.turned + 2} 页（${why || '继续作答'}）`);
+      /* WorkModule 没有 NextModule 的 click() 方法；这里直接走 DOM 原生点击，
+         必要时补发鼠标事件，避免分页翻页因 this.click 不存在而中断。 */
+      try {
+        if (target && typeof target.click === 'function') target.click();
+        else if (target) ['mousedown', 'mouseup', 'click'].forEach((type) => fireMouse(target, type));
+        else return false;
+      } catch (e) {
+        warn('点击「下一题」失败:', (e && e.message) || e);
+        return false;
+      }
+
+      /* 等题目换掉：翻页是异步的，必须等签名变化再抓题，否则会重复答同一题。 */
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000) {
+        await sleep(300);
+        const now = this.pageQuestionSig();
+        if (now && now !== sig) {
+          nav.turned++;
+          return true;
+        }
+      }
+
+      /* 没换题：记下来，避免下一轮原地重试同一颗按钮。 */
+      nav.gaveUpSig = sig;
+      warn('点了「下一题」但题目没有变化，本轮不再重试（下一轮观察再看）');
+      return false;
+    },
+
+    /* 分页答题的一轮：只作答当前这一题，答完就翻页。返回 loop() 用的结果码。 */
+    async pagedTurn(questions) {
+      /* 先按页面真实状态判断"这页答过没有"：刷新回来后 handled 是空的，只看它会重复作答。 */
+      const already = questions.filter((q) => this.isAnswered(q.el).answered);
+      if (already.length === questions.length) {
+        this.markAlreadyAnswered(already);
+        if (this.pagedNav.gaveUpSig === this.pageQuestionSig()) return 'idle';
+        const turned = await this.turnToNextQuestion('当前页已作答');
+        return turned ? 'ok' : 'idle';
+      }
+
+      /* 这一页**部分**答过：已答的那几道也要挂「已作答」徽标（以前只在"整页都答过"时才标，
+         用户看到的是"这页有答案但脚本题旁什么提示都没有"）。 */
+      if (already.length) this.markAlreadyAnswered(already);
+
+      /* 已作答的题**绝不**再进 fresh —— 以前只挡了 handled，页面刷新回来 handled 是空的，
+         于是脚本会把用户手答的那道题重新问一遍模型并覆盖掉。 */
+      const fresh = questions.filter((q) => !this.handled.has(q.sig) && !this.isAnswered(q.el).answered);
+      if (!fresh.length) {
+        /* 当前页已经答过（比如页面重载回来）→ 直接翻页。 */
+        if (this.pagedNav.gaveUpSig === this.pageQuestionSig()) return 'idle';
+        const turned = await this.turnToNextQuestion('当前页已作答');
+        return turned ? 'ok' : 'idle';
+      }
+
+      const total = fresh.length;
+      let filled;
+      if (CONFIG.answerMode === 'batch') {
+        this.markProgress(fresh, 'asking', 'AI 作答中…');
+        const answers = await this.askApi(fresh);
+        filled = CONFIG.dryRun
+          ? fresh.filter((q) => this.applyOne(q, answers[q.id])).length
+          : this.fill(fresh, answers, { keepFailedUnhandled: true });
+      } else {
+        filled = await this.answerOneByOne(fresh);
+      }
+
+      /* 演练模式：只报告，不翻页、不提交。 */
+      if (CONFIG.dryRun) {
+        this.lastApi = `演练完成：${filled}/${total} 题能找到对应元素（未提交、未翻页）`;
+        log(`[演练] 本轮 ${filled}/${total} 题能落到元素上；演练不点击、不翻页、不提交`);
+        return 'idle';
+      }
+
+      if (!filled) {
+        this.failStreak++;
+        this.lastApi = `失败：当前页 0 题回填（连续 ${this.failStreak} 次）`;
+        warn('当前页一个答案都没填上，**不翻页**也不提交，稍后重试');
+        return 'failed';
+      }
+      this.failStreak = 0;
+
+      if (filled < total) {
+        this.lastApi = `部分完成：当前页 ${filled}/${total} 题`;
+        fresh.filter((q) => !this.elFilled(q)).forEach((q) => this.retryLater(q, '未答上'));
+        warn(`当前页只答上 ${filled}/${total} 道，先不翻页（缺答案会直接算错），稍后自动重试`);
+        return 'failed';
+      }
+
+      this.lastApi = `成功：当前页 ${filled}/${total} 题`;
+      const turned = await this.turnToNextQuestion('当前页已作答');
+      if (turned) return 'ok';
+
+      /* 翻不动了：要么最后一题，要么按钮失效。这时才进考试闸门。 */
+      this.finishPaged();
+      return 'ok';
+    },
+
+    /* 分页答题走到头：给出"该人工交卷"的明确结论（默认**不**自动交卷）。 */
+    finishPaged() {
+      const answered = this.handled.size;
+      const nav = this.pagedNav;
+      if (this.examLike() && !CONFIG.examAutoSubmit) {
+        this.lastApi = `已翻完 ${nav.turned + 1} 页、作答 ${answered} 题（考试页，等待手动交卷）`;
+        log(`分页答题已翻完 ${nav.turned + 1} 页、作答 ${answered} 题 —— 考试页默认不自动交卷，请检查后手动交卷`);
+      } else {
+        this.lastApi = `分页答题结束：翻了 ${nav.turned} 页、作答 ${answered} 题`;
+        log(`分页答题结束：共翻 ${nav.turned} 页、作答 ${answered} 题`);
+      }
+      this.pagedDone = true;
+    },
+
+    /* 当前是不是"分页答题"形态：页面上有可点的「下一题」，且当前页题目数远少于页面题量。 */
+    isPagedPaper(questions) {
+      /* 只在**考试/测验**页启用：作业页（doHomeWorkNew）v1.9.8 逐题作答行为必须原样不变。 */
+      if (!CONFIG.pagedAutoNext) return false;
+      if (!this.examLike()) return false;
+      if (!this.findNextQuestionButton()) return false;
+
+      let expected = 0;
+      try { expected = this.paperTotal(); } catch (e) { expected = 0; }
+      const n = (questions || []).length || 1;
+      if (expected && n >= expected) return false;   // 整卷都在这一页：不是分页答题
+      if (n > 3) return false;                        // 一页三四道以上，按整卷处理更稳
+
+      /* 手里已经答过的题已经超过单页容量 → 这是分页答题；否则等页面自己给证据（下一轮再说）。 */
+      return this.handled.size >= n || !!expected;
     },
 
     /* 元素是否处于"禁用/不可点"状态（只看稳定的结构信号，不猜样式） */
@@ -5876,6 +6217,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           }
           this.catalogSkipped = false;
 
+          /* 「下一题」刚点下去：题目还没换，这一轮什么都不做，等它换完。 */
+          if (this.pagedNav && Date.now() - this.pagedNav.lastClickAt < 2500) {
+            this.wait = 800;
+            return;
+          }
+
           const n = this.findContainers().length;
           if (n > 0) {
             /* 等题目全部渲染出来再抓。 */
@@ -5933,6 +6280,9 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       this.obfChecked = false;
       /* 手动重新执行 = 全部重来：不清"已填"标记的话，上次填过但没落到编辑器里的题会被整批跳过 */
       this.clearFilledMarks();
+      /* 重新读一次"已作答"记录（别的标签页可能改过），但**不清**它 —— 记录本来就是跨刷新的。 */
+      this.answeredCache = null;
+      this.redoAt.clear();
       if (CONFIG.answerEnabled) this.watch();
     },
 
@@ -5984,10 +6334,25 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
       this.running = true;
       try {
-        const questions = this.collect();
+        let questions = this.collect();
+        /* 分页考试翻页后，上一页可能留有 data-cx-filled 标记；即使当前页暂时被过滤，
+           也要用完整题目集合恢复题签和进度徽标。普通作业仍走原有过滤路径。 */
+        if (!questions.length && this.examLike() && this.findNextQuestionButton()) {
+          questions = this.collect(true);
+        }
         if (!questions.length) return 'idle';
 
-        const fresh = questions.filter((q) => !this.handled.has(q.sig));
+        /* 分页答题（考试一页一题）：每轮只答当前这一页，答完翻页，直到翻不动为止。 */
+        if (this.isPagedPaper(questions)) {
+          this.lastApi = '分页答题：按「一页一题」逐页作答';
+          return await this.pagedTurn(questions);
+        }
+
+        /* 页面上已经有答案的题（含刷新前脚本答的、用户手答的）：只标状态，不再自动作答。 */
+        const done = questions.filter((q) => this.isAnswered(q.el).answered);
+        this.markAlreadyAnswered(done);
+
+        const fresh = questions.filter((q) => !this.handled.has(q.sig) && !this.isAnswered(q.el).answered);
         if (!fresh.length) return 'idle';   // 已处理过，安静跳过（观察是常态，别刷屏）
 
         const total = fresh.length;
@@ -6048,6 +6413,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         }
 
         if (CONFIG.autoSubmit) {
+          /* 用户刚点了「重新作答」：他还在改答案，这时候自动交卷等于把他的改动锁死。 */
+          if (this.hasRedoStar()) {
+            this.lastApi = '暂不提交：有题目被要求「重新作答」，等这一道答完再说';
+            log('有题目被要求「重新作答」，本轮**不自动交卷**（交了就改不了了）');
+            return 'ok';
+          }
           /* 这个判断**不能**只看"这一轮填了几道"： */
           const audit = this.auditPaper();
           if (!audit.complete) {
@@ -6193,7 +6564,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     /* 抓取题目：题干 + 选项 + 题型 */
-    collect() {
+    collect(includeFilled = false) {
       /* 文本还原：题目所在 frame 若被 font-cxsecret 混淆过。 */
       const doc = questionRoot() || document;
       const dec = (s) => SecretFont.decode(doc, s);
@@ -6202,7 +6573,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       const all = this.findContainers();
       const posOf = new Map();
       all.forEach((el, i) => posOf.set(el, i));
-      const containers = all.filter((el) => {
+      /* includeFilled：把已作答的题也返回，用来画"已作答"徽标；默认仍只要没填过的。 */
+      const containers = includeFilled ? all : all.filter((el) => {
         try { return !el.hasAttribute(FILLED_MARK); } catch (e) { return true; }
       });
 
@@ -6248,9 +6620,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         const optionByKey = {};
         for (const o of parsed) if (!optionByKey[o.key]) optionByKey[o.key] = o.el;
 
-        /* 真正的输入区：富文本 iframe 的 body 优先，隐藏 textarea 只是 UEditor 的原元素 */
+        /* 真正的输入区：富文本 iframe 的 body 优先，隐藏 textarea 只是 UEditor 的原元素。
+           **不传单个 rich**：多空填空题每个空一个 UEditor，传第一只会把其余空全丢掉
+           （真机 workId=56139156 第 4 题两空，只填第 1 空的根因）。 */
         const rich = richEditorOf(el);
-        const blanks = this.blankTargets(el, rich);
+        const richAll = richEditorsOf(el);
+        const blanks = this.blankTargets(el, null);
 
         /* 题干图片 + 每个选项的图片：公式/示意图常常只有图，没有文字 */
         const images = stemImagesOf(el, Q_SELECTORS.option);
@@ -6300,6 +6675,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           optionByKey,                  // 字母 → 元素，不受过滤影响
           blankEls: blanks,
           editor: rich && rich.body ? 'ueditor' : '',
+          blankCount: richAll.length || blanks.length,
           latex: latexCount,   // 题干里被转成 LaTeX 的公式图数量
           images,          // 题干图片（绝对地址）
           optionImages,    // 选项字母 → 图片地址
@@ -6368,22 +6744,31 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     /* 一道题在页面上是否已有作答。 */
     isAnswered(el) {
-      const out = { answered: false, how: '', detectable: false };
+      const out = { answered: false, how: '', detectable: false, letters: '' };
       if (!el) return out;
 
-      // 1) 隐藏的 answer 输入框（最高优先：提交读的就是它）
+      // 0) 先把"页面说是哪几个字母"读出来：选项勾选态比隐藏框更具体，徽标要靠它显示「已作答 A」
+      let opts = [];
+      try { opts = this.pickAll(el, Q_SELECTORS.option); } catch (e) { opts = []; }
+      let picked = '';
+      try { picked = checkedLettersOf(el, opts); } catch (e) { picked = ''; }
+
+      // 1) 隐藏的 answer<qid> 输入框（排除 answerId，那是卷子标识）
+      let fieldKey = '';
+      let fieldVal = '';
       try {
-        for (const inp of el.querySelectorAll('input[type="hidden"]')) {
-          const key = String(inp.name || inp.id || '');
-          if (!/^answer\d+$/.test(key)) continue;
+        for (const inp of answerFieldsOf(el)) {
           out.detectable = true;
-          if (String(inp.value == null ? '' : inp.value).trim()) {
-            out.answered = true;
-            out.how = `隐藏框 ${key}`;
-            return out;
-          }
+          const v = String(inp.value == null ? '' : inp.value).trim();
+          if (v) { fieldKey = String(inp.name || inp.id || ''); fieldVal = v; break; }
         }
       } catch (e) { /* 忽略 */ }
+      if (picked || fieldVal) {
+        out.answered = true;
+        out.letters = picked || fieldVal;
+        out.how = picked ? `选项已选 ${picked}` : `隐藏框 ${fieldKey}（${fieldVal.slice(0, 8)}）`;
+        return out;
+      }
 
       // 2) 原生 radio / checkbox
       try {
@@ -6395,34 +6780,39 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         }
       } catch (e) { /* 忽略 */ }
 
-      // 3) 选项选中态 / aria-checked（超星的选项是 div.answerBg，不是原生 radio）
-      let opts = [];
-      try { opts = this.pickAll(el, Q_SELECTORS.option); } catch (e) { opts = []; }
-      for (const o of opts) {
-        try {
-          if (o.hasAttribute && o.hasAttribute('aria-checked')) out.detectable = true;
-          if ((o.matches && o.matches(OPTION_CHECKED_SEL)) ||
-              (o.querySelector && o.querySelector(OPTION_CHECKED_SEL))) {
-            out.answered = true;
-            out.how = '选项选中态';
-            return out;
-          }
-        } catch (e) { /* 单个选项失败不影响其它 */ }
-      }
+      // 3) 选项选中态已在第 0/1 档读过（picked）；这里只补"有选项但没选中"这个可读性信号
+      try {
+        if (opts.some((o) => {
+          try { return (o.hasAttribute && (o.hasAttribute('aria-checked') || o.hasAttribute('aria-pressed'))); }
+          catch (e) { return false; }
+        })) out.detectable = true;
+      } catch (e) { /* 忽略 */ }
 
-      // 4) 填空 / 简答（含 UEditor 富文本）
-      /* 富文本 iframe 里的内容才是真答案：藏起来的 textarea 可能被写过、页面上却什么都没有 */
-      const richBox = richEditorOf(el);
-      if (richBox && richBox.body) {
+      // 4) 填空 / 简答（含 UEditor 富文本）—— **多空要全看完**
+      /* 富文本 iframe 里的内容才是真答案：藏起来的 textarea 可能被写过、页面上却什么都没有。
+         多空填空题每个空一个编辑器：任一有内容就算"答过"，但只有**全部**有内容才算"填满"
+         （只填第 1 空时不能当成已答完，否则提交前的整卷核对会放过它）。 */
+      const richBoxes = richEditorsOf(el);
+      if (richBoxes.length) {
         out.detectable = true;
-        if (String(richBox.body.textContent || '').replace(/[\u200b\s]/g, '')) {
+        let filled = 0;
+        for (const box of richBoxes) {
+          if (box && box.body && String(box.body.textContent || '').replace(/[\u200b\s]/g, '')) filled++;
+        }
+        out.blankCount = richBoxes.length;
+        out.blankFilled = filled;
+        if (filled) {
           out.answered = true;
-          out.how = '富文本编辑器有内容';
+          out.blankComplete = filled === richBoxes.length;
+          out.how = filled === richBoxes.length
+            ? (richBoxes.length > 1 ? `富文本 ${filled}/${richBoxes.length} 空都有内容` : '富文本编辑器有内容')
+            : `富文本只填了 ${filled}/${richBoxes.length} 空`;
           return out;
         }
       }
       let blanks = [];
-      try { blanks = this.blankTargets(el, richBox); } catch (e) { blanks = []; }
+      /* 不传 rich：blankTargets 自己会按空收集**全部**编辑器（多空填空题每个空一个） */
+      try { blanks = this.blankTargets(el, null); } catch (e) { blanks = []; }
       if (blanks.length) out.detectable = true;
       for (const b of blanks) {
         try {
@@ -6488,8 +6878,10 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       }
 
       const suspicious = containers.length === 1 && this.looksLikeWrapper(containers[0]);
-      const paginated = !!this.findNextQuestionButton();
-      const countOk = expected === 0 || containers.length >= expected;
+      /* 分页答题已经逐页答完时，页面上仍留着「下一题」按钮，此时它不能再当"整卷没答完"的证据。 */
+      const hasNext = !!this.findNextQuestionButton();
+      const paginated = hasNext && !this.pagedAllAnswered(expected);
+      const countOk = expected === 0 || containers.length >= expected || this.pagedAllAnswered(expected);
       // 页面能读出作答状态时必须每一道都答了；读不出状态时只能信调用方（loop 的 filled）
       const answeredOk = !detectable || unanswered.length === 0;
       const complete = containers.length > 0 && countOk && answeredOk && !suspicious && !paginated;
@@ -6508,6 +6900,19 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       };
     },
 
+    /* 分页答题是否已经把所有题目都作答过（按已作答页数 × 单页题量对页面题量核对）。 */
+    pagedAllAnswered(expected) {
+      if (!expected || !this.pagedNav) return false;
+      if (!this.pagedNav.turned && !this.pagedDone) return false;
+      if (this.pagedNav.turned + 1 >= expected || this.pagedDone) return true;
+      /* 翻页没走到位、但页面上确实一次能看到的题都已有答案 → 也算作答完（刷新回来靠它）。 */
+      try {
+        const shown = this.collect(true);
+        return shown.length > 0 && shown.length < expected &&
+               shown.every((q) => this.isAnswered(q.el).answered);
+      } catch (e) { return false; }
+    },
+
     /* 把 auditPaper() 的结果翻译成"用户看得懂、能行动"的一句话 */
     describeAudit(a) {
       if (!a) return '检查失败';
@@ -6517,7 +6922,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       if (a.expected) parts.push(`页面题量 ${a.expected} 道`);
       if (a.detectable) parts.push(`已作答 ${a.answered} 道`);
       if (a.suspicious) parts.push('唯一命中的容器里有多道题/几十个选项（疑似整卷外壳）');
-      if (a.paginated) parts.push('页面上还有「下一题」（分页答题，当前页不是整卷）');
+      if (a.paginated) parts.push('页面上还有「下一题」（分页答题，当前题还没答完）');
       if (a.expected && a.containers < a.expected) parts.push('识别到的题数少于页面题量');
       if (a.detectable && a.answered < a.containers) parts.push(`还有 ${a.containers - a.answered} 道没作答`);
       return parts.join('，');
@@ -6795,9 +7200,33 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       }
     },
 
+    /* 页面上已经有答案的题：显示「已作答」，并挂一个「重新作答」按钮。 */
+    markAlreadyAnswered(questions) {
+      if (!CONFIG.showProgress) return;
+      for (const q of questions) {
+        /* 文案带上页面读到的字母（`已作答 A` / `已作答 AC`）：超星页面上勾选态很淡，
+           徽标不写字母的话用户分不清"这题真的答了"还是"徽标画错了"。 */
+        let detail = '';
+        try {
+          const st = this.isAnswered(q.el);
+          if (st && st.letters) detail = ' ' + String(st.letters).slice(0, 6);
+        } catch (e) { /* 忽略 */ }
+        try {
+          QProgress.set(q.el, 'answered', '已作答' + detail, () => this.redoQuestion(q));
+        } catch (e) { /* 单题失败不影响其它 */ }
+        /* 记进 handled：同一轮里别再把它当新题请求一次模型。 */
+        try { this.handled.add(q.sig); } catch (e) { /* 忽略 */ }
+        /* 已经有记录的保留原答案，只给"页面上有答案但没有记录"的题补一笔（刷新后靠它免答）。 */
+        if (!this.answeredBefore(q)) this.markAnswered(q, '');
+      }
+    },
+
     markOne(q, state, text) {
       if (!CONFIG.showProgress) return;
-      try { QProgress.set(q.el, state, text); } catch (e) { /* 忽略 */ }
+      /* 重答按钮一直挂着：以前只有「已作答」那一档带 onRedo，下一圈观察 markOne()
+         用不带按钮的签名重画一次，按钮就被摘掉了 —— 用户看到「按钮一闪就没了」。
+         保留它也不会误点：徽标主体是 pointer-events:none，只有按钮自己能收点击。 */
+      try { QProgress.set(q.el, state, text, () => this.redoQuestion(q)); } catch (e) { /* 忽略 */ }
     },
 
     /* 这道题在页面上是否已被标记为"填过了" */
@@ -6848,6 +7277,12 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         } catch (e) { /* 拿不到属性就照常处理 */ }
 
         if (!settled) {
+          /* 这题之前已经答过（刷新前面答的）：不覆盖，只标状态。 */
+          if (this.answeredBefore(q) && this.isAnswered(q.el).answered) {
+            this.markOne(q, 'answered', '已作答（跳过重复作答）');
+            settled = true;
+            ok++;
+          } else {
           const ans = answers[q.id];
           if (ans === undefined || ans === null || ans === '') {
             // 模型没给这道题答案（漏题 / 解析不出）—— 必须显式标出来，
@@ -6855,6 +7290,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           } else {
             try {
               if (this.fillOne(q, String(ans))) {
+                this.markAnswered(q, ans);
                 ok++;
                 settled = true;
                 // 打上"已填"标记：同源的另一层 frame 看到它就会跳过，避免重复点击
@@ -6871,6 +7307,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
                    `\n    ${describeQuestion(q)}`);
               this.markOne(q, 'fail', '回填异常');
             }
+          }
           }
         }
 
@@ -7024,13 +7461,35 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
       // 填空 / 简答：按分隔符拆成多空
       if (r.kind === 'blank') {
-        const parts = A.split(/\s*[|｜;；]\s*/);
+        const parts = A.split(/\s*[|｜;；]\s*/).map((s) => s.trim()).filter((s) => s !== '');
         /* 只有一个输入区（简答 / 计算题的富文本）时不能按 | 拆：那是多问答案，拆开会丢掉后一半 */
         const single = r.targets.length === 1;
+
+        /* 空比答案段多：宁可留空也别把第 1 空的答案抄到第 2 空（那是明确的错答案）。
+           原来这里 `parts[i] ?? parts[0]` 会把第 1 段复制到所有空，比留空更糟。 */
+        if (!single && parts.length < r.targets.length) {
+          warn(`这道题有 ${r.targets.length} 个空，但答案只给了 ${parts.length} 段（"${this.shortAnswer(A)}"）——` +
+               '空着的空留空，请核对模型是否按 "答案1|答案2" 的格式作答');
+        }
+
+        /* 先把"每个空该填什么"算出来，再统一回填。规则（按优先级）：
+           · 单输入区（简答/计算题）：不拆，多段用换行连起来；
+           · 空数 == 段数：一一对应；
+           · 空数 >  段数：前几空按序取，剩下的空留空（绝不复制第 1 段）；
+           · 空数 <  段数：最后一空收下所有多余的段（别丢答案）。 */
+        const n = r.targets.length;
+        const perBlank = [];
+        if (single) {
+          for (let i = 0; i < n; i++) perBlank.push(parts.length > 1 ? parts.join('\n') : A);
+        } else if (parts.length >= n) {
+          for (let i = 0; i < n - 1; i++) perBlank.push(parts[i] || '');
+          perBlank.push(parts.slice(n - 1).join(' '));
+        } else {
+          for (let i = 0; i < n; i++) perBlank.push(parts[i] || '');
+        }
+
         r.targets.forEach((el, i) => {
-          const val = single
-            ? (parts.length > 1 ? parts.join('\n') : A)
-            : (parts[i] ?? parts[0] ?? A);
+          const val = perBlank[i] == null ? '' : perBlank[i];
           const tag = String(el.tagName || '').toUpperCase();
           /* UEditor 的可编辑区在 iframe 的 body 里：只写 textarea 页面什么都不显示 */
           if (tag === 'BODY' || (el.isContentEditable && tag !== 'TEXTAREA' && tag !== 'INPUT')) {
@@ -7049,6 +7508,173 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
       for (const el of r.targets) this.clickOption(el);
       return true;
+    },
+
+    /* ---------- 已作答记录：跨刷新记住"这题答过了"，并支持手动重新作答 ---------- */
+
+    /* 内存里的记录缓存：GM 存储是**同步阻塞**的，观察循环每几秒就要问一遍
+       "这题答过没有"，每题一次 GM_getValue 会把主线程拖住（docs/约束与红线.md 第 8 条）。
+       所以只读一次，之后全走这个缓存；写入合并延后落盘（同 pushLog/flushLogs 的做法）。 */
+    answeredCache: null,
+    answeredFlushTimer: null,
+    answeredKeyCache: '',
+
+    /* 记录按「任务点」分组：换一场考试/作业自然从零开始。 */
+    answeredStore() {
+      const key = taskKey() || location.pathname;
+      const now = Date.now();
+
+      /* 缓存命中：同一个任务点、没过期就直接用，不碰 GM 存储。 */
+      const c = this.answeredCache;
+      if (c && c.key === key && now - (c.at || 0) <= ANSWERED_TTL_MS && !c.stale) {
+        if (!c.items || typeof c.items !== 'object') c.items = {};
+        return c;
+      }
+
+      let rec = null;
+      try { rec = GM_getValue(ANSWERED_KEY, null); } catch (e) { rec = null; }
+      if (!rec || rec.key !== key || now - (rec.at || 0) > ANSWERED_TTL_MS) {
+        rec = { key, at: now, items: {} };
+      }
+      if (!rec.items || typeof rec.items !== 'object') rec.items = {};
+      this.answeredCache = rec;
+      return rec;
+    },
+
+    /* 合并落盘：多次 markAnswered 只写一次存储，避免热路径上的阻塞写。 */
+    saveAnsweredStore(rec) {
+      if (rec) {
+        rec.at = Date.now();            // 有活动就续期，免得边用边过期
+        this.answeredCache = rec;
+      }
+      if (this.answeredFlushTimer) return;
+      this.answeredFlushTimer = Timers.after(() => {
+        this.answeredFlushTimer = null;
+        const c = this.answeredCache;
+        if (!c) return;
+        try { GM_setValue(ANSWERED_KEY, c); } catch (e) { /* 存不下就只是刷新后不再免答，不影响作答 */ }
+      }, 1200);
+    },
+
+    /* 这道题的记录键：题面指纹优先（页面刷新后 sig 不变），拿不到再退回 sig。 */
+    answeredKeyOf(q) {
+      if (!q) return '';
+      const body = normSig(q.question) + '|' + (q.options || []).map((o) => normSig(o.text)).join('|');
+      return body.length > 10 ? body : String(q.sig || '');
+    },
+
+    /* 记录里这道题是脚本答过的吗？ */
+    answeredBefore(q) {
+      const k = this.answeredKeyOf(q);
+      if (!k) return false;
+      const rec = this.answeredStore();
+      return !!rec.items[k];
+    },
+
+    /* 记一笔"这题脚本答过了"。 */
+    markAnswered(q, ans) {
+      const k = this.answeredKeyOf(q);
+      if (!k) return;
+      const rec = this.answeredStore();
+      rec.items[k] = { at: Date.now(), answer: this.shortAnswer(ans) };
+      const keys = Object.keys(rec.items);
+      if (keys.length > 500) {
+        keys.sort((a, b) => (rec.items[a].at || 0) - (rec.items[b].at || 0))
+            .slice(0, keys.length - 500).forEach((x) => { delete rec.items[x]; });
+      }
+      this.saveAnsweredStore(rec);
+    },
+
+    /* 用户点徽标上的「重新作答」：忘掉记录、清掉页面上的答案，让下一轮重新答。 */
+    redoQuestion(q) {
+      if (!q || !q.el) return;
+      const k = this.answeredKeyOf(q);
+      if (k) {
+        const rec = this.answeredStore();
+        delete rec.items[k];
+        this.saveAnsweredStore(rec);
+        /* 「重新作答」是用户点出来的低频操作，直接落盘 + 作废缓存：
+           别的同源 frame 也各有一份缓存，等它们自然过期要 6 小时。 */
+        try { if (this.answeredFlushTimer) { Timers.clear(this.answeredFlushTimer); this.answeredFlushTimer = null; } } catch (e) { /* 忽略 */ }
+        try { GM_setValue(ANSWERED_KEY, rec); } catch (e) { /* 忽略 */ }
+        this.answeredCache = null;
+      }
+      this.clearQuestionAnswer(q);
+      this.handled.delete(q.sig);
+      this.qTries.delete(q.sig);
+      this.failStreak = 0;
+      /* 复核：清完之后页面上**确实**读不到作答了，否则下一轮 isAnswered() 会立刻又判"已作答"，
+         用户看到的就是"点重新作答没反应"。 */
+      let still = null;
+      try { still = this.isAnswered(q.el); } catch (e) { still = null; }
+      if (still && still.answered) {
+        warn(`「重新作答」：第 ${(q.index || 0) + 1} 题清空后仍读得到作答（${still.how}），` +
+             '请手动取消勾选后再点一次');
+      } else {
+        log(`「重新作答」：第 ${(q.index || 0) + 1} 题已清空，下一轮重新作答`);
+      }
+      /* 立刻把徽标从「已作答」改成「等待作答」，不要等下一轮观察（最多 8 秒）。 */
+      this.markOne(q, 'none', '已清空，等待重新作答');
+
+      /* 「重新作答」是**用户明确要求重来这一题**，必须能突破那两道会让循环动手不了的闸门，
+         否则点了没反应（徽标停在原地、也再没人来答）：
+         · 任务点已完成 → markDone 会把徽标整批清掉、watch 每 30 秒空转；
+         · 字体混淆 → watchdog 只要 obfChecked 就短路，永远走不到作答。 */
+      if (this.done) {
+        this.done = false;
+        this.doneWhy = '';
+        log('「重新作答」：清掉本任务点"已完成"的缓存，重新观察这一题');
+      }
+      if (this.obfuscated) {
+        this.obfuscated = false;
+        this.obfChecked = false;
+        log('「重新作答」：重开字体混淆检测');
+      }
+      /* 记下"用户点名要重答的题"，watch 的 doneReason 闸门会对它放行（见 doneReason）。 */
+      try { this.redoAt.set(q.sig, Date.now()); } catch (e) { /* 忽略 */ }
+
+      /* 下一轮观察提前一点：用户点了按钮就该马上看到反应。 */
+      this.wait = Math.min(this.wait || 1500, 1500);
+      if (!this.watching && CONFIG.answerEnabled) { try { this.watch(); } catch (e) { /* 忽略 */ } }
+    },
+
+    /* 用户点名要重答的题（sig → 时间）。只为让"任务点已完成"那道闸门放行。 */
+    redoAt: new Map(),
+
+    /* 清掉页面上这道题的答案（勾选态 / 输入框 / 富文本）。 */
+    clearQuestionAnswer(q) {
+      if (!q || !q.el) return;
+      let opts = [];
+      try { opts = q.allOptionEls || q.optionEls || []; } catch (e) { opts = []; }
+
+      /* 选择题：直接摘 check_answer / aria + 清 answer<qid>。
+         不用"再点一次"：单选是开关，遇到已经点掉的项反而会把答案**点上**。 */
+      try { clearChoiceState(q.el, opts); } catch (e) { /* 忽略 */ }
+
+      /* 填空 / 简答：富文本 body、原 textarea、可编辑区都清一遍。 */
+      let blanks = [];
+      try { blanks = q.blankEls || []; } catch (e) { blanks = []; }
+      try { if (richeditorReset(q.el)) { /* 已清 */ } } catch (e) { /* 忽略 */ }
+      for (const b of blanks) {
+        try {
+          const tag = String(b.tagName || '').toUpperCase();
+          if (tag === 'INPUT' || tag === 'TEXTAREA') setNativeValue(b, '');
+          else {
+            b.innerHTML = '<p><br></p>';
+            b.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        } catch (e) { /* 单个元素失败不影响其它 */ }
+      }
+      /* 没解析出 blankEls 也要清：刷新回来的题重新 collect() 前可能拿不到。 */
+      try { richeditorReset(q.el); } catch (e) { /* 忽略 */ }
+      try {
+        for (const inp of q.el.querySelectorAll('textarea[name^="answer"], input[type="text"], input:not([type])')) {
+          setNativeValue(inp, '');
+        }
+      } catch (e) { /* 忽略 */ }
+
+      try { q.el.removeAttribute(FILLED_MARK); } catch (e) { /* 忽略 */ }
+      try { QProgress.clear(q.el); } catch (e) { /* 忽略 */ }
     },
 
     /* 把一道题的答案落到页面上； */
@@ -7373,15 +7999,32 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     } catch (e) { return false; }
   }
 
-  /* 富文本编辑器（UEditor）：可编辑区在 iframe 的 body 里，外层只有工具条 */
+  /* 富文本编辑器（UEditor）：可编辑区在 iframe 的 body 里，外层只有工具条。
+     **一道题可能有多个**：多空填空题每个空一个 UEditor（真机 ueditor_0 / ueditor_1），
+     所以这里返回全部，richEditorOf() 只取第一个（单空 / 简答题用）。 */
+  function richEditorsOf(el) {
+    if (!el || !el.querySelectorAll) return [];
+    let iframes = [];
+    try {
+      iframes = Array.from(el.querySelectorAll('iframe[id^="ueditor_"]'));
+      if (!iframes.length) iframes = Array.from(el.querySelectorAll('.edui-editor iframe'));
+    } catch (e) { iframes = []; }
+
+    const out = [];
+    for (const iframe of iframes) {
+      let body = null;
+      try { body = iframe.contentDocument ? iframe.contentDocument.body : null; } catch (e) { body = null; }
+      /* 编辑器外层容器跟着 rtf 一起带出去：填完要按"这个空"回写它自己的 textarea */
+      let host = null;
+      try { host = iframe.closest('.blankItemDiv, .blankItemInp, .textDIV, .eidtDiv, li'); } catch (e) { host = null; }
+      out.push({ iframe, body, host });
+    }
+    return out;
+  }
+
+  /* 第一个富文本编辑器（单空填空题 / 简答题）。 */
   function richEditorOf(el) {
-    if (!el || !el.querySelector) return null;
-    let iframe = null;
-    try { iframe = el.querySelector('iframe[id^="ueditor_"]') || el.querySelector('.edui-editor iframe'); } catch (e) { iframe = null; }
-    if (!iframe) return null;
-    let body = null;
-    try { body = iframe.contentDocument ? iframe.contentDocument.body : null; } catch (e) { body = null; }
-    return { iframe, body };
+    return richEditorsOf(el)[0] || null;
   }
 
   /* 模型常把数学答案写成 LaTeX（\frac{1}{2}）；编辑器里显示原文很丑，做一次保守的纯文本化 */
@@ -7399,19 +8042,35 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     return t.trim();
   }
 
-  /* 这道题真正的可输入元素：富文本 body 优先，其次可见输入框，最后才退回隐藏 textarea */
+  /* 这道题真正的可输入元素：富文本 body 优先，其次可见输入框，最后才退回隐藏 textarea。
+     **按空逐一收集**：多空填空题每个空是一个 .blankItemDiv，里面各有自己的 UEditor。
+     只取第一个编辑器会导致"第 2 空永远填不上"（真机 workId=56139156 第 4 题两空）。 */
   function pickBlankTargets(el, rich) {
-    const box = rich || richEditorOf(el);
+    const boxes = rich ? [rich] : richEditorsOf(el);
     const out = [];
-    if (box && box.body) out.push(box.body);
 
+    /* 1) 每个编辑器（= 页面上每一空）自己的 body，顺序即「第1空/第2空」。 */
+    for (const box of boxes) {
+      if (box && box.body) out.push(box.body);
+    }
+
+    /* 2) 没有富文本的普通输入框（旧版填空 / 判断题的文本框）。 */
     let cands = [];
     try { cands = Array.from(el.querySelectorAll(Q_SELECTORS.blank.join(','))); } catch (e) { cands = []; }
 
+    const ownedBodies = new Set(out);
     const hidden = [];
     for (const c of cands) {
-      if (box && box.body === c) continue;
-      try { if (box && box.iframe && box.iframe.parentElement && box.iframe.parentElement.contains(c)) continue; } catch (e) { /* 忽略 */ }
+      if (ownedBodies.has(c)) continue;
+      /* 落在任一编辑器容器里的输入框归那个编辑器管，别重复收集（UEditor 的原 textarea 就在这里）。 */
+      let inEditor = false;
+      for (const box of boxes) {
+        try {
+          if (box && box.iframe && box.iframe.parentElement && box.iframe.parentElement.contains(c)) { inEditor = true; break; }
+          if (box && box.host && box.host.contains(c)) { inEditor = true; break; }
+        } catch (e) { /* 忽略 */ }
+      }
+      if (inEditor) continue;
       if (isHiddenField(c)) { hidden.push(c); continue; }
       out.push(c);
     }
@@ -7468,6 +8127,113 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
   }
 
   /* ==== UEditor 回填 END ==== */
+
+  /* 把一道题里的 UEditor 清空（实例 setContent + body innerHTML + 原 textarea 同步）。 */
+  function richeditorReset(qEl) {
+    let did = false;
+    /* 多空填空题每个空一个编辑器，漏清任何一个都会让「重新作答」看起来"没反应"（那一空还留着旧答案）。 */
+    try {
+      for (const box of richEditorsOf(qEl)) {
+        if (!box || !box.body) continue;
+        box.body.innerHTML = '<p><br></p>';
+        for (const t of ['input', 'keyup', 'change', 'blur']) {
+          try { box.body.dispatchEvent(new Event(t, { bubbles: true })); } catch (e) { /* 忽略 */ }
+        }
+        try { ueditorSetContent(box.body, ''); } catch (e) { /* 忽略 */ }
+        /* 每个空自己的 UEditor 原 textarea（answerEditor<qid><n>）也要清，否则 sync() 会写回去 */
+        try {
+          const host = box.host || (box.iframe && box.iframe.parentElement);
+          const ta = host && host.querySelector ? host.querySelector('textarea') : null;
+          if (ta) setNativeValue(ta, '');
+        } catch (e) { /* 忽略 */ }
+        did = true;
+      }
+    } catch (e) { /* 忽略 */ }
+    try { syncHiddenAnswerField(qEl, ''); } catch (e) { /* 忽略 */ }
+    return did;
+  }
+
+  /* ==== 选项作答判读 BEGIN（bench/answered-state-test.js 会原样提取这一段来测）==== */
+  /* 超星把每道题的答案放在 <input type="hidden" id="answer<qid>" name="answer<qid>"> 里，
+     addChoice/addMultipleChoice 只改选项的 class + aria 再回写这个框。
+     **必须排除** name="answerId"：那是"卷子标识"，不是作答。 */
+  const CHOICE_ANSWER_RE = /^answer(\d+)$/;
+
+  /* 从题号 key（`answer405743328` / `answer405743328`）里取出 qid，不是作答框的返回 ''。 */
+  function answerQidOf(key) {
+    const m = String(key == null ? '' : key).match(CHOICE_ANSWER_RE);
+    return m ? m[1] : '';
+  }
+
+  /* 某道题所有"存答案"的隐藏框（不含 answerId / answertype<qid>）。 */
+  function answerFieldsOf(el) {
+    const out = [];
+    if (!el || !el.querySelectorAll) return out;
+    try {
+      for (const inp of el.querySelectorAll('input[type="hidden"]')) {
+        if (answerQidOf(String(inp.name || inp.id || ''))) out.push(inp);
+      }
+    } catch (e) { /* 忽略 */ }
+    return out;
+  }
+
+  /* 页面 DOM 上"这道题被选中了哪些选项"，返回字母串（如 "AB"）；没选中返回 ''。
+     判据与页面自己的 addChoice 一致：选项行/选项标号上的 check_answer + aria-checked。 */
+  function checkedLettersOf(el, optionEls) {
+    let letters = '';
+    const seen = new Set();
+    for (const o of (optionEls || [])) {
+      if (!o || !o.matches) continue;
+      let on = false;
+      try {
+        on = o.matches(OPTION_CHECKED_SEL) || !!o.querySelector(OPTION_CHECKED_SEL);
+      } catch (e) { on = false; }
+      if (!on) continue;
+      /* 字母优先读选项上的 data（超星 `<span class="num_option ..." data="A">`），其次 qid 所在 li。 */
+      let L = '';
+      try {
+        const lab = o.querySelector('[data]') || o;
+        const d = String(lab.getAttribute('data') || '');
+        if (/^[A-Za-z]$/.test(d)) L = d.toUpperCase();
+      } catch (e) { /* 忽略 */ }
+      if (!L) {
+        try {
+          const sib = Array.from(o.parentElement ? o.parentElement.children : []);
+          L = String.fromCharCode(65 + sib.indexOf(o));
+        } catch (e) { L = ''; }
+      }
+      if (L && !seen.has(L)) { seen.add(L); letters += L; }
+    }
+    return letters;
+  }
+
+  /* 清掉一道选择题在页面上的勾选态：**直接摘类/属性再回写隐藏框**，
+     不用"再点一次"的合成点击 —— 单选是开关，点两下等于没点。 */
+  function clearChoiceState(el, optionEls) {
+    let n = 0;
+    for (const o of (optionEls || [])) {
+      if (!o || !o.matches) continue;
+      let hit = false;
+      try { hit = o.matches(OPTION_CHECKED_SEL); } catch (e) { hit = false; }
+      const nodes = [];
+      if (hit) nodes.push(o);
+      try { Array.from(o.querySelectorAll(OPTION_CHECKED_SEL)).forEach((x) => nodes.push(x)); } catch (e) { /* 忽略 */ }
+      for (const x of nodes) {
+        try {
+          x.classList.remove('cur', 'selected', 'checked', 'choose', 'choosed', 'check_answer', 'check_answer_dx');
+        } catch (e) { /* 忽略 */ }
+        for (const a of ['aria-checked', 'aria-pressed']) {
+          try { if (x.hasAttribute(a)) x.setAttribute(a, 'false'); } catch (e) { /* 忽略 */ }
+        }
+        n++;
+      }
+    }
+    for (const f of answerFieldsOf(el)) {
+      try { setNativeValue(f, ''); } catch (e) { /* 忽略 */ }
+    }
+    return n;
+  }
+  /* ==== 选项作答判读 END ==== */
 
   /* ==== 题目图片 BEGIN（bench/question-image-test.js 会原样提取这一段来测）==== */
 
@@ -8087,6 +8853,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           <div class="row"><span>自动提交</span><input type="checkbox" id="autoSubmit" ${c.autoSubmit ? 'checked' : ''}></div>
           <!-- 考试交卷独立于 autoSubmit：默认不勾，避免考试被自动交掉；作业的自动提交行为不受影响 -->
           <div class="row"><span>考试自动交卷</span><input type="checkbox" id="examAutoSubmit" ${c.examAutoSubmit ? 'checked' : ''}></div>
+          <div class="row"><span>分页答题自动翻页</span><input type="checkbox" id="pagedAutoNext" ${c.pagedAutoNext ? 'checked' : ''}></div>
           <div class="row"><span>提交前确认</span><input type="checkbox" id="submitConfirm" ${c.submitConfirm ? 'checked' : ''}></div>
           <div class="row"><span>兜底答案</span><input type="text" id="fallbackAnswer" value="${esc(c.fallbackAnswer)}" placeholder="留空=跳过"></div>
           <p class="tip">
@@ -8111,6 +8878,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           </div>
           <div class="btns">
             <button id="btnRefresh">重新执行</button>
+            <button id="btnRedoAll">本页全部重新作答</button>
             <button id="btnPopup">弹窗诊断</button>
             <button id="btnExportLog">导出日志</button>
             <button id="btnClearLog">清空日志</button>
@@ -8152,6 +8920,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       bindToggle('autoSubmit', 'autoSubmit');
       // 考试交卷开关独立于 autoSubmit（考试被直接交卷是高风险动作，默认关；作业行为不变）
       bindToggle('examAutoSubmit', 'examAutoSubmit');
+      bindToggle('pagedAutoNext', 'pagedAutoNext');
       bindToggle('submitConfirm', 'submitConfirm');
       bindToggle('logEnabled', 'logEnabled');
       bindToggle('debug', 'debug');
@@ -8276,6 +9045,47 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         this.flash('已通知所有 frame 重新执行');
       };
 
+      /* 把本页所有"已作答"的题清空、丢掉记录，让脚本重新答一遍。
+         题目在子 frame 里，所以走广播；二次确认是必须的 —— 这一步会**清掉页面上真实的答案**
+         （包括用户自己手答的），而且不可撤销。 */
+      $('btnRedoAll').onclick = () => {
+        let qs = [];
+        try { qs = WorkModule.collect(true); } catch (e) { qs = []; }
+        const done = qs.filter((q) => {
+          try { return WorkModule.isAnswered(q.el).answered; } catch (e) { return false; }
+        });
+        /* 顶层常常一道题都抓不到（题目在 iframe 里）：这时不能直接说"没有已作答的题"，
+           得把广播发出去，由真正持有题目的 frame 去数、去清。 */
+        if (qs.length && !done.length) { this.flash('本页没有已作答的题'); return; }
+        const tip = done.length
+          ? `将清空本页 ${done.length} 道已作答的题（含你自己手答的），并让脚本重新作答。`
+          : '将清空所有 frame 里已作答的题（含你自己手答的），并让脚本重新作答。';
+        if (!confirm(`${tip}\n此操作不可撤销，确定？`)) return;
+        requestRedoAll();
+        log(`手动触发「本页全部重新作答」（${done.length} 道 / 本 frame）`);
+        this.flash(done.length ? `已清空 ${done.length} 道，脚本将重新作答` : '已通知所有 frame 重新作答');
+      };
+
+      /* 诊断里"题目作答情况"那一行：脚本按页面真实状态算，不读记录。 */
+      this.answeredLine = () => {
+        try {
+          const qs = WorkModule.collect(true);
+          if (!qs.length) return '作答情况: （本 frame 没抓到题目）';
+          let done = 0;
+          const letters = [];
+          for (const q of qs) {
+            let st = null;
+            try { st = WorkModule.isAnswered(q.el); } catch (e) { st = null; }
+            if (st && st.answered) {
+              done++;
+              if (st.letters) letters.push(`${(q.index || 0) + 1}${st.letters}`);
+            }
+          }
+          const head = `作答情况: 已作答 ${done}/${qs.length} 道（脚本只答剩下的 ${qs.length - done} 道）`;
+          return letters.length ? `${head} · 已答: ${letters.slice(0, 12).join(' ')}${letters.length > 12 ? '…' : ''}` : head;
+        } catch (e) { return '作答情况: 读不到（' + ((e && e.message) || e) + '）'; }
+      };
+
       // 诊断：把运行时的关键指标打到日志区，用来判断有没有泄漏 / 卡在哪一步
       $('btnDiag').onclick = async () => {
         const v = VideoModule.video;
@@ -8302,6 +9112,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           `提交弹窗: ${WorkModule.findDialogConfirm() ? '检测到确定按钮（会点）' : '未检测到（弹窗出现时点「弹窗诊断」）'}`,
           `作答方式: ${CONFIG.answerMode === 'batch' ? '整卷一次' : `逐题作答（失败重试 ${Number(CONFIG.answerRetries) || 0} 次）`}`,
           `题旁进度: ${CONFIG.showProgress ? '开' : '关'}`,
+          this.answeredLine(),
           CONFIG.dryRun ? '演练模式: 开（只报告，不点击、不提交）' : '',
           `答题模块: ${WorkModule.running ? '正在请求中' : (WorkModule.watching ? `观察中，下次 ${WorkModule.wait}ms 后` : '未观察（循环已停）')}`,
           WorkModule.done
@@ -9943,6 +10754,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     /* 「重新执行」的接收端：**所有** frame 都注册。 */
     registerRetryListener();
+    /* 「本页全部重新作答」的接收端：题目在哪个 frame 里，就由那个 frame 自己清。 */
+    registerRedoAllListener();
     // 状态上报：诊断面板靠它看到子 frame 里到底发生了什么
     registerReportListener();
     // 等模块都起来了再上报，否则报的是"还没启动"的状态，没有参考价值
