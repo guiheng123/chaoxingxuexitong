@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通 · 自动刷课 + 自定义API答题
 // @namespace    local.chaoxing.auto
-// @version      2.0.0
+// @version      2.0.2
 // @description  自动播放/静音/倍速/防暂停/自动下一节/刷完回个人空间；答题支持直连大模型（内置提示词，只需填地址+密钥）或自定义接口
 // @license      MIT
 // @author       guiheng123
@@ -47,7 +47,7 @@
     '- type=multi（多选）：answer 为多个选项字母连写，如 "ABD"，不要加逗号或空格。',
     '- type=judge（判断）：answer 写 "对" 或 "错"。',
     '- type=blank（填空）：多个空按先后顺序用 "|" 分隔。',
-    '- type=essay（简答/论述）：answer 为简明答案文本。',
+    '- type=essay（简答/论述/计算）：answer 为简明答案文本，不要用 "|" 分隔。',
     '- 即使不确定也必须给出最可能的答案，不要留空、不要写"无法确定"。',
   ].join('\n');
 
@@ -93,6 +93,8 @@
     answerEnabled: false,
   /* 在每道题旁显示 AI 作答进度徽标。 */
     showProgress: true,
+  /* 题目上方那个 div 块旁挂一个「提示词作答」按钮：点它自己写提示词，只让 AI 答这一题。 */
+    promptAskButton: true,
   /* 把题干/选项里的图片一起发给模型（超星把公式渲染成图片，纯图片选项没有文字）。 */
     sendImages: true,
   /* 作答方式：'per' 逐题作答（默认，一次请求只发一道题，拿到答案立刻回填）／'batch' 整卷一次。 */
@@ -154,7 +156,7 @@
     } catch (e) { return 'p?'; }
   })();
   /* 版本号在代码里的唯一来源，必须和文件头的 @version 保持一致 —— 曾因导出日志里硬编码 "1.4.2" 而漏改， */
-  const SCRIPT_VERSION = '2.0.0';
+  const SCRIPT_VERSION = '2.0.2';
   /* 版本变了就清空旧日志缓冲：旧版本写的行没有分组标记，面板没法判断它属于哪个页面。 */
   try {
     const LOG_VERSION_KEY = 'cx_auto_logver';
@@ -2139,6 +2141,15 @@
   /* ===== 5. 答题模块 ===== */
 
   /* ==== AI 答题纯函数 BEGIN（bench/ai-answer-test.js 会原样提取这一段来测）==== */
+
+  /* 把用户在题旁写的提示词追加到系统提示词后面（纯函数，bench 直接测） */
+  function composePromptWithExtra(base, extra) {
+    const tail = String(extra == null ? '' : extra).trim();
+    const head = String(base == null ? '' : base).trim();
+    if (!tail) return head;
+    if (!head) return tail;
+    return head + '\n\n用户对本题的额外要求（优先遵守；但输出的 JSON 数组格式与 id/answer 约定仍然必须严格遵守）：\n' + tail;
+  }
 
   /* 把用户填的「API 地址」补成完整 chat/completions 端点（多为 base + /chat/completions）。 */
   function resolveChatEndpoint(u, isFull) {
@@ -5572,6 +5583,216 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
   };
 
+  /* 题上方的「提示词作答」按钮：点它自己写提示词，只让 AI 答这一题 */
+  const QAsk = {
+    ATTR: 'data-cx-askbar',
+    BTN: 'data-cx-askbtn',
+
+    /* 取到（必要时创建）某道题上方的按钮条，幂等：重复调用不重建 DOM */
+    ensure(el) {
+      try {
+        if (!el) return null;
+        let bar = el.querySelector('[' + QAsk.ATTR + ']');
+        if (!bar) {
+          const doc = el.ownerDocument || document;
+          bar = doc.createElement('div');
+          bar.setAttribute(QAsk.ATTR, '1');
+          /* 插在题目上方第一个块（题型/题干那一行 div）之前，和进度徽标并排 */
+          const first = el.firstChild;
+          if (first) el.insertBefore(bar, first); else el.appendChild(bar);
+
+          const st = bar.style;
+          const put = (k, v) => { try { st.setProperty(k, v, 'important'); } catch (e) { /* 忽略 */ } };
+          put('display', 'inline-block');
+          put('margin', '0 6px 6px 0');
+          put('font-family', 'system-ui,-apple-system,"Microsoft YaHei",sans-serif');
+          put('pointer-events', 'none');   // 按钮条本身别挡住题目的点击
+        }
+        /* 题目元素记在按钮条上：回调里不必再闭包捕获，重复调用也不会攒闭包 */
+        try { bar.__cxEl = el; } catch (e) { /* 忽略 */ }
+
+        let btn = bar.querySelector('[' + QAsk.BTN + ']');
+        if (!btn) {
+          const doc = el.ownerDocument || document;
+          btn = doc.createElement('button');
+          btn.type = 'button';
+          btn.setAttribute(QAsk.BTN, '1');
+          btn.textContent = '✎ 提示词作答';
+          btn.title = '自己写提示词，只让 AI 答这一题';
+          btn.style.cssText = 'padding:1px 10px;border:1px solid #c5d4f6;border-radius:10px;' +
+            'background:#f0f5ff;color:#3158a6;font-size:12px;line-height:18px;font-weight:600;' +
+            'font-family:inherit;cursor:pointer;pointer-events:auto;user-select:none;';
+          btn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const host = bar.__cxEl || bar.parentNode;
+            try { AskPanel.open(host); } catch (e) { /* 忽略 */ }
+          });
+          bar.appendChild(btn);
+        }
+        return btn;
+      } catch (e) { return null; }
+    },
+
+    /* 清掉某道题的按钮条 */
+    clear(el) {
+      try {
+        const bar = el && el.querySelector('[' + QAsk.ATTR + ']');
+        if (bar) bar.remove();
+      } catch (e) { /* 忽略 */ }
+    },
+
+    /* 清掉当前文档里所有按钮（关功能时用） */
+    clearAll() {
+      try {
+        document.querySelectorAll('[' + QAsk.ATTR + ']').forEach((n) => n.remove());
+      } catch (e) { /* 忽略 */ }
+      try {
+        const root = questionRoot();
+        if (root && root !== document) root.querySelectorAll('[' + QAsk.ATTR + ']').forEach((n) => n.remove());
+      } catch (e) { /* 忽略 */ }
+    },
+  };
+
+  /* 题旁「提示词作答」的浮层：写提示词 → 只让 AI 答这一题（独立 shadow DOM，不受页面样式影响） */
+  const AskPanel = {
+    host: null, shadow: null, box: null, input: null, head: null, prev: null, status: null,
+    el: null, lastPrompt: '',
+
+    mount() {
+      if (this.host) return;
+      const host = document.createElement('div');
+      host.setAttribute('data-cx-askpanel', '1');
+      host.style.cssText = 'all:initial;display:none;position:fixed;z-index:2147483646;';
+      const shadow = host.attachShadow({ mode: 'open' });
+      shadow.innerHTML = `
+        <style>
+          :host { all: initial; }
+          * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+          #box {
+            position: fixed; width: 360px; background: #1b1d23; color: #e6e8ee;
+            border: 1px solid #2e323c; border-radius: 10px; padding: 10px 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,.45); font-size: 12px;
+          }
+          #head { font-weight: 600; font-size: 12.5px; color: #fff; margin-bottom: 4px; }
+          #prev {
+            color: #8b94a6; font-size: 10.5px; line-height: 1.5; margin-bottom: 7px;
+            max-height: 34px; overflow: hidden;
+          }
+          textarea {
+            width: 100%; min-height: 82px; resize: vertical; outline: none;
+            background: #14161b; border: 1px solid #333846; border-radius: 6px;
+            color: #e6e8ee; padding: 6px 7px; font-size: 12px; line-height: 1.5;
+            font-family: ui-monospace, Consolas, monospace;
+          }
+          textarea:focus { border-color: #4c8bf5; }
+          .row { display: flex; gap: 7px; margin-top: 8px; }
+          .row button {
+            flex: 1; padding: 6px 0; border-radius: 7px; border: 1px solid #3a4050;
+            background: #262a33; color: #dfe3ea; cursor: pointer; font-size: 12px;
+          }
+          .row button:hover { background: #303541; }
+          .row button.primary { background: #2f6fe0; border-color: #2f6fe0; color: #fff; }
+          .row button.primary:hover { background: #3d7cf0; }
+          #status { margin-top: 6px; color: #ffd591; font-size: 10.5px; min-height: 14px; line-height: 1.5; }
+          .tip { color: #6f7889; font-size: 10.5px; line-height: 1.5; margin: 5px 0 0; }
+        </style>
+        <div id="box">
+          <div id="head">提示词作答</div>
+          <div id="prev"></div>
+          <textarea id="ta" placeholder="在这里写要求，例如：只给最可能的答案，不要解释；这道题按公式推导，答案写 LaTeX；按题干字面意思作答"></textarea>
+          <div class="row">
+            <button id="ok" class="primary">让 AI 作答</button>
+            <button id="cancel">取消</button>
+          </div>
+          <div id="status"></div>
+          <p class="tip">提示词只对本道题生效；<b>Ctrl+Enter</b> 提交，<b>Esc</b> 关闭。留空 = 用面板里的默认提示词。答案只填到页面上，<b>不会自动交卷</b>。</p>
+        </div>
+      `;
+
+      this.host = host;
+      this.shadow = shadow;
+      this.box = shadow.getElementById('box');
+      this.head = shadow.getElementById('head');
+      this.prev = shadow.getElementById('prev');
+      this.input = shadow.getElementById('ta');
+      this.status = shadow.getElementById('status');
+
+      shadow.getElementById('ok').addEventListener('click', () => this.submit());
+      shadow.getElementById('cancel').addEventListener('click', () => this.close());
+      this.input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); this.close(); return; }
+        if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); this.submit(); }
+      });
+
+      document.documentElement.appendChild(host);
+    },
+
+    /* 打开面板：题目可能在页面很下面，位置跟着题目走 */
+    open(el) {
+      if (!el) return;
+      try {
+        this.mount();
+        this.el = el;
+        let q = null;
+        try { q = WorkModule.questionFor(el); } catch (e) { q = null; }
+        this.head.textContent = q ? `提示词作答 · 第 ${q.index + 1} 题` : '提示词作答';
+        this.prev.textContent = q ? String(q.question || '').slice(0, 120) : '';
+        this.status.textContent = hasAnswerApiConfig() ? '' : '⚠ 还没配好答题接口：面板 → 答题 → API 地址 / 密钥';
+        this.input.value = this.lastPrompt || '';
+        this.position(el);
+        this.host.style.display = 'block';
+        this.trackScroll();
+        try { this.input.focus(); } catch (e) { /* 忽略 */ }
+      } catch (e) { warn('提示词面板打开失败:', (e && e.message) || e); }
+    },
+
+    position(el) {
+      try {
+        const r = el.getBoundingClientRect();
+        const w = 360, h = 240;
+        const vw = (window && window.innerWidth) || 1024;
+        const vh = (window && window.innerHeight) || 768;
+        this.box.style.left = Math.max(8, Math.min(r.right + 12, vw - w - 8)) + 'px';
+        this.box.style.top = Math.max(8, Math.min(r.top, vh - h - 8)) + 'px';
+      } catch (e) { /* 位置算不出来就留在默认位置 */ }
+    },
+
+    /* 面板跟着题目走：只在打开期间挂一个被动监听，关掉立刻摘掉（不外泄常驻监听）。 */
+    trackScroll() {
+      if (this.onScroll || typeof window === 'undefined' || !window.addEventListener) return;
+      this.onScroll = () => { if (this.el) this.position(this.el); };
+      try { window.addEventListener('scroll', this.onScroll, { passive: true, capture: true }); } catch (e) { this.onScroll = null; }
+    },
+
+    untrackScroll() {
+      if (!this.onScroll) return;
+      try { window.removeEventListener('scroll', this.onScroll, { capture: true }); } catch (e) { /* 忽略 */ }
+      this.onScroll = null;
+    },
+
+    close() {
+      this.el = null;
+      this.untrackScroll();
+      try { if (this.host) this.host.style.display = 'none'; } catch (e) { /* 忽略 */ }
+    },
+
+    submit() {
+      const el = this.el;
+      if (!el) return;
+      if (!hasAnswerApiConfig()) {
+        this.status.textContent = '⚠ 还没配好答题接口（面板 → 答题）';
+        return;
+      }
+      const p = String((this.input && this.input.value) || '').trim();
+      this.lastPrompt = p;          // 同一页连续答几题时省得重写
+      this.close();
+      Promise.resolve()
+        .then(() => WorkModule.askOne(el, p))
+        .catch((e) => warn('提示词作答失败:', (e && e.message) || e));
+    },
+  };
+
   /* 已作答记录：跨刷新记住"这道题是脚本答的"，刷新后不再自动作答。 */
   const ANSWERED_KEY = 'cx_answered_v1';
 
@@ -5607,6 +5828,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
            `${(q.blankEls || []).length > 1 ? ` 多空=${(q.blankEls || []).length}` : ''}` +
            ` 图片=${(q.images || []).length}/${Object.keys(q.optionImages || {}).length}` +
            ` 公式=${q.latex || 0}` +
+           `${q.typeHint ? ` 线索="${String(q.typeHint).slice(0, 20)}"` : ''}` +
            ` 题干="${String(q.question || '').slice(0, 30)}"` +
            `${opts.length ? `\n      选项明细: ${optTxt}` : ''}`;
   }
@@ -5875,12 +6097,15 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     start() {
-      if (!CONFIG.answerEnabled) {
+      /* 「提示词作答」按钮也要观察循环来挂：只开按钮、不自动作答是合法组合。 */
+      if (!CONFIG.answerEnabled && !CONFIG.promptAskButton) {
         // 这句要留：用户看到"无反应"时最想确认的就是"到底有没有启动"
         log('答题功能未启用，跳过（面板 → 答题 → 启用）');
         return;
       }
-      log('答题模块启动，开始观察题目…');
+      log(CONFIG.answerEnabled
+        ? '答题模块启动，开始观察题目…'
+        : '「提示词作答」按钮已启用（自动作答是关的）：只挂按钮，不主动请求接口');
       this.watch();
     },
 
@@ -6199,6 +6424,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         if (!this.watching) return;
         try {
           if (!CONFIG.answerEnabled) {
+            /* 「提示词作答」按钮独立于自动作答：只开这个开关时挂按钮、不主动请求接口。 */
+            if (CONFIG.promptAskButton) this.syncAskButtons();
             // 开关被关掉了：不干活，但保持循环活着，等它被重新打开
             this.wait = 8000;
             return;
@@ -6206,7 +6433,13 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
           /* 任务点已完成 → 不再作答。 */
           const why = this.doneReason();
-          if (why) { this.markDone(why); this.wait = 30000; return; }
+          if (why) {
+            this.markDone(why);
+            /* markDone 会清掉进度徽标，但按钮是另一件事：已交的卷子也允许手动问某一题。 */
+            this.syncAskButtons();
+            this.wait = 30000;
+            return;
+          }
           if (this.chapterDoneByCatalog()) {
             if (!this.catalogSkipped) {
               this.catalogSkipped = true;
@@ -6225,6 +6458,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
           const n = this.findContainers().length;
           if (n > 0) {
+            /* 「提示词作答」按钮不依赖自动作答：已完成 / 已暂停的卷子也要能手动问某一题。 */
+            this.syncAskButtons();
             /* 等题目全部渲染出来再抓。 */
             await this.waitForPaper();
             const r = this.findContainers().length > 0 ? await this.loop() : 'idle';
@@ -6632,29 +6867,15 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
         const optionImages = {};
         for (const o of parsed) if (o.img) optionImages[o.key] = o.img;
 
-        /* 题型：优先读容器自带的 typename（新版作业页 div.questionLi[typename="多选题"]）， */
-        let typeHint = '';
-        try { typeHint = String(el.getAttribute('typename') || el.getAttribute('qtype') || ''); } catch (e) { /* 忽略 */ }
-        if (!typeHint) {
-          try {
-            const n = el.querySelector('.newZy_TItle, .TiMuTitle, .mark_type, .colorShallow');
-            typeHint = (n && n.textContent) || '';
-          } catch (e) { /* 忽略 */ }
-        }
-        if (!typeHint) typeHint = stem;
-
-        let type = 'single';
-        if (/多选/.test(typeHint)) type = 'multi';
-        else if (/判断/.test(typeHint)) type = 'judge';
-        else if (/填空/.test(typeHint) || blanks.length) type = 'blank';
-        else if (/简答|论述|名词解释|问答/.test(typeHint)) type = 'essay';
-        else {
-          try {
-            if (el.querySelector('input[type="checkbox"]')) type = 'multi';
-            /* 判「没选项 = 填空」必须用**未过滤**的选项元素数：纯图片选项的正文是空的 */
-            else if (!el.querySelector('input[type="radio"]') && !optionEls.length) type = 'blank';
-          } catch (e) { /* 忽略 */ }
-        }
+        /* 题型：容器属性 / 题型徽标 / 分组标题 / 页面结构 —— 见「题型判定」段。
+           **不能**再写成「有输入框就是填空」：简答、计算题的答题区也是 UEditor。 */
+        const typeInfo = questionTypeOf(el, {
+          stem,
+          blankCount: richAll.length || blanks.length,
+          hasOptions: optionEls.length > 0,   // 未过滤：纯图片选项的正文是空的
+        });
+        const type = typeInfo.type;
+        const typeHint = typeInfo.typeHint;
 
         const qid = this.questionIdOf(el, pos);
         const sig = `${qid}::${stem.replace(/\s+/g, '').slice(0, 80)}`;
@@ -6664,6 +6885,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           index: pos,
           qid,
           type,
+          typeHint,
           question: stem.replace(/\s+/g, ' ').trim(),
           options: options.map((o) => (o.img
             ? { key: o.key, text: o.text || '(图片选项)', image: true }
@@ -6953,20 +7175,24 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     /* ---------- 调外部 API ---------- */
 
-    async askApi(questions) {
-      if (CONFIG.apiMode === 'custom') return this.askCustom(questions);
-      return this.askAI(questions);
+    async askApi(questions, opts) {
+      if (CONFIG.apiMode === 'custom') return this.askCustom(questions, opts);
+      return this.askAI(questions, opts);
     },
 
     /* 模式 A：直连大模型（默认）。 */
-    async askAI(questions) {
+    async askAI(questions, opts) {
       const endpoint = resolveChatEndpoint(CONFIG.apiUrl, CONFIG.apiUrlFull);
       if (!endpoint) {
         warn('未填写 API 地址，跳过答题');
         return this.fallback(questions);
       }
 
-      const system = String(CONFIG.promptTemplate || '').trim() || DEFAULT_PROMPT;
+      /* 题旁「提示词作答」会带一段自定义要求：追加在系统提示词后面，**不替换**输出约定。 */
+      const extra = String((opts && opts.extraPrompt) || '').trim();
+      const system = composePromptWithExtra(
+        String(CONFIG.promptTemplate || '').trim() || DEFAULT_PROMPT, extra);
+      if (extra) log(`本题使用自定义提示词（${extra.length} 字符）`);
       const headers = { 'Content-Type': 'application/json' };
       if (CONFIG.apiKey) headers.Authorization = 'Bearer ' + String(CONFIG.apiKey).trim();
 
@@ -7108,12 +7334,16 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     },
 
     /* 模式 B：自定义接口（高级）。 */
-    async askCustom(questions) {
+    async askCustom(questions, opts) {
+      /* 自定义接口没有"系统提示词"这个概念，但题目旁的提示词仍需带给接口：
+         多一个 prompt 字段，模板里可以用 {{prompt}}；没有占位符也不影响老接口。 */
+      const extra = String((opts && opts.extraPrompt) || '').trim();
       const payload = questions.map((q) => ({
         id: q.id,
         type: q.type,
         question: q.question,
         options: q.options,
+        ...(extra ? { prompt: extra } : {}),
       }));
 
       const headers = this.parseHeaders();
@@ -7227,6 +7457,106 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
          用不带按钮的签名重画一次，按钮就被摘掉了 —— 用户看到「按钮一闪就没了」。
          保留它也不会误点：徽标主体是 pointer-events:none，只有按钮自己能收点击。 */
       try { QProgress.set(q.el, state, text, () => this.redoQuestion(q)); } catch (e) { /* 忽略 */ }
+    },
+
+    /* 观察循环每圈给已认出的容器补「提示词作答」按钮（幂等） */
+    syncAskButtons() {
+      if (!CONFIG.promptAskButton) return;
+      let els = [];
+      try { els = this.findContainers(); } catch (e) { return; }
+      for (const el of els) {
+        try { QAsk.ensure(el); } catch (e) { /* 单题失败不影响其它 */ }
+      }
+    },
+
+    /* 页面上某个题目元素对应的题目对象（按钮回调里只有元素）。 */
+    questionFor(el) {
+      if (!el) return null;
+      try {
+        const list = this.collect(true);
+        for (const q of list) if (q.el === el) return q;
+      } catch (e) { /* 忽略 */ }
+
+      /* 兜底：collect() 会丢掉"题干取不到文字"的容器（整题只有图），按最小可用形态现拼一个 */
+      try {
+        const doc = questionRoot() || document;
+        const dec = (s) => SecretFont.decode(doc, s);
+        const stemEl = this.stemElementOf(el);
+        let pos = 0;
+        try { pos = this.findContainers().indexOf(el); } catch (e) { pos = 0; }
+        if (pos < 0) pos = 0;
+        const blanks = this.blankTargets(el, null);
+        const optionEls = this.pickAll(el, Q_SELECTORS.option);
+        const stem = stemEl ? textWithLatex(stemEl, dec) : '';
+        const qid = this.questionIdOf(el, pos);
+        const typeInfo = questionTypeOf(el, { stem, blankCount: blanks.length, hasOptions: optionEls.length > 0 });
+        const type = typeInfo.type;
+        return {
+          id: `q${pos + 1}`,
+          index: pos,
+          qid,
+          type,
+          typeHint: typeInfo.typeHint,
+          question: stem.replace(/\s+/g, ' ').trim(),
+          options: [],
+          sig: `${qid}::${stem.replace(/\s+/g, '').slice(0, 80)}`,
+          el,
+          optionEls: [],
+          allOptionEls: optionEls,
+          optionByKey: {},
+          blankEls: blanks,
+          blankCount: blanks.length,
+          images: stemEl ? stemImagesOf(el, Q_SELECTORS.option) : [],
+          optionImages: {},
+        };
+      } catch (e) { return null; }
+    },
+
+    /* 用户点题旁「提示词作答」：只答这一题、只回填不交卷 */
+    async askOne(el, extraPrompt) {
+      if (!el) return false;
+      if (!CONFIG.answerEnabled) {
+        /* 按钮属于答题模块，但用户是明确点它要答案的：直接放行比"点了没反应"好。 */
+        log('「提示词作答」：答题开关是关的，本次仍按你的要求作答（不改配置）');
+      }
+      const q = this.questionFor(el);
+      if (!q) { warn('「提示词作答」：这道题已不在页面上（页面重新渲染了？）'); return false; }
+
+      /* 挡住观察循环：否则它会在我们请求在飞的时候用**默认**提示词再答一遍，把结果盖掉。 */
+      this.handled.add(q.sig);
+
+      this.markOne(q, 'asking', 'AI 作答中…（自定义提示词）');
+      let answers = {};
+      try {
+        answers = await this.askApi([q], { extraPrompt });
+      } catch (e) {
+        warn(`「提示词作答」第 ${q.index + 1} 题请求失败:`, this.explainApiError(e, resolveChatEndpoint(CONFIG.apiUrl, CONFIG.apiUrlFull)));
+        answers = {};
+      }
+
+      /* 请求期间用户可能又点了别的按钮把这一题重画过：确认元素还活着。 */
+      try { if (!q.el.isConnected) { warn('「提示词作答」：题目元素已被页面替换，本次结果丢弃'); return false; } } catch (e) { /* 忽略 */ }
+
+      const a = answers[q.id];
+      if (a === undefined || a === null || a === '') {
+        this.markOne(q, 'none', '未作答：无答案');
+        this.handled.delete(q.sig);      // 放回观察循环，下一轮还能用默认提示词重试
+        warn(`「提示词作答」第 ${q.index + 1} 题模型没给出答案`);
+        return false;
+      }
+
+      /* 拿到答案才清旧答案：先清的话接口一失败就把用户手写的答案清没了 */
+      try { this.redoQuestion(q); } catch (e) { /* 忽略 */ }
+      this.handled.add(q.sig);           // redoQuestion 会把 sig 从 handled 里摘掉，补回来
+
+      const ok = this.applyOne(q, a);
+      if (ok) {
+        log(`「提示词作答」第 ${q.index + 1} 题已填入：${this.shortAnswer(a)}（不自动交卷）`);
+        this.lastApi = `提示词作答：第 ${q.index + 1} 题已填入 ${this.shortAnswer(a)}`;
+      } else {
+        this.handled.delete(q.sig);
+      }
+      return ok;
     },
 
     /* 这道题在页面上是否已被标记为"填过了" */
@@ -8153,6 +8483,131 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
     return did;
   }
 
+  /* ==== 题型判定 BEGIN（bench/question-type-test.js 会原样提取这一段来测）==== */
+  /* 分组标题：新版作业/测验页只把题型写在「一.计算题（共7 题,100.0分）」这种小标题里，
+     题目容器本身既没有 typename 也没有题型徽标。 */
+  const SECTION_TITLE_RE = /^[一二三四五六七八九十]+\s*[.、]\s*\S{1,10}题/;
+
+  function sectionTitleOf(el) {
+    if (!el || !el.parentNode) return '';
+    const titleText = (n) => {
+      if (!n) return '';
+      let t = '';
+      try { t = String(n.textContent || '').replace(/\s+/g, ' ').trim(); } catch (e) { t = ''; }
+      if (!t || t.length > 40 || !SECTION_TITLE_RE.test(t)) return '';
+      /* 包着题目的分区外壳整块文本也可能以「一.计算题…」开头，那不是标题，别把它当线索。 */
+      try {
+        if (n.querySelector && n.querySelector(QUESTION_ANY)) return '';
+      } catch (e) { /* 忽略 */ }
+      return t;
+    };
+    let node = el;
+    for (let depth = 0; depth < 6; depth++) {
+      const parent = node && node.parentNode;
+      if (!parent) break;
+      /* 分区容器自己的标题（「一.计算题」常常就是本分区的第一个子节点） */
+      if (depth > 0 && node.querySelector) {
+        let head = null;
+        try { head = node.querySelector('.Cy_TItle1, h1, h2, h3, .mark_title'); } catch (e) { head = null; }
+        const own = titleText(head);
+        if (own) return own;
+      }
+      let sibs = [];
+      try { sibs = Array.from(parent.children || []); } catch (e) { sibs = []; }
+      for (let i = sibs.indexOf(node) - 1; i >= 0; i--) {
+        const sib = sibs[i];
+        const own = titleText(sib);
+        if (own) return own;
+        let inner = null;
+        try { inner = sib.querySelector('.Cy_TItle1, h1, h2, h3, .mark_title, .Zy_TItle2'); } catch (e) { inner = null; }
+        const it = titleText(inner);
+        if (it) return it;
+      }
+      node = parent;
+    }
+    return '';
+  }
+
+  /* 填空的**结构证据**：每个空一个 .blankItemDiv、一个 tiankongsize 隐藏框、「第N空：」标签。
+     简答 / 计算题只有一个编辑器，这三样一个都没有 —— 这是两者唯一的可靠区别。 */
+  function blankStructureOf(el) {
+    const out = { item: 0, size: 0, span: 0, underscores: 0, any: false };
+    if (!el || !el.querySelectorAll) return out;
+    try { out.item = el.querySelectorAll('.blankItemDiv, .blankItem').length; } catch (e) { /* 忽略 */ }
+    try {
+      for (const inp of el.querySelectorAll('input')) {
+        const key = String((inp && (inp.name || inp.id)) || '');
+        if (key.indexOf('tiankongsize') !== 0) continue;
+        const n = parseInt(String((inp && inp.value) || ''), 10);
+        if (n > 0) out.size = Math.max(out.size, n);
+      }
+    } catch (e) { /* 忽略 */ }
+    try { out.span = el.querySelectorAll('.tiankong').length; } catch (e) { /* 忽略 */ }
+    try {
+      const stemEl = el.querySelector('.Zy_TItle, .mark_name, .qtContent');
+      const stem = String((stemEl && stemEl.textContent) || '');
+      out.underscores = (stem.match(/_{2,}|＿{2,}/g) || []).length;
+    } catch (e) { /* 忽略 */ }
+    out.any = !!(out.item || out.size || out.span || out.underscores >= 2);
+    return out;
+  }
+
+  /* 题型线索：越具体越优先。填空与简答都用 UEditor，只按「有没有输入框」判必然把简答判成填空。
+     **题干不能当线索**：选择题的题干里出现「计算」「判断」是常态（"下列计算正确的是"），
+     拿它当题型会把选择题判成简答/计算题，答案就按文本灌进编辑器了。 */
+  const TYPE_HINT_BLANK_RE = /填空/;
+  const TYPE_HINT_ESSAY_RE = /简答|论述|名词解释|问答|计算|分析|证明|作图|其他/;
+
+  /* 纯函数：线索 + 结构 → 题型（bench 直接测这一段）。 */
+  function decideQuestionType(input) {
+    const o = input || {};
+    const hint = String(o.typeHint || '');
+    const blankCount = Math.max(0, Number(o.blankCount) || 0);
+    const struct = o.blankStruct || { any: false, underscores: 0 };
+    /* 没给就是「不知道」，按没有选项处理：不确定时宁可判简答（原文写进编辑器），也别判选择而丢掉答案。 */
+    const hasOptions = o.hasOptions === true;
+
+    if (/多选/.test(hint)) return 'multi';
+    if (/判断/.test(hint)) return 'judge';
+    if (TYPE_HINT_BLANK_RE.test(hint)) return 'blank';
+    if (TYPE_HINT_ESSAY_RE.test(hint)) return 'essay';
+
+    /* 没有题型线索时看结构：分空结构（或 2 个以上输入区）= 填空；只有一个输入区 = 简答 / 计算题。 */
+    if (blankCount > 1 || struct.any) return 'blank';
+    /* 只有一个输入区、又没有分空结构 → 简答 / 计算题。有选项就说明是选择题（哪怕旁边挂了个编辑器）。 */
+    if (blankCount === 1) return hasOptions ? 'single' : 'essay';
+    if (o.hasCheckbox) return 'multi';
+    if (o.hasRadio) return 'single';
+    return hasOptions ? 'single' : 'essay';
+  }
+
+  /* DOM 包装：线索按「容器属性 → 题型徽标 → 分组标题」取，取到就交给纯函数判。**不读题干**。 */
+  function questionTypeOf(el, opts) {
+    const o = opts || {};
+    let typeHint = String(o.typeHint || '');
+    if (!typeHint) {
+      try { typeHint = String(el.getAttribute('typename') || el.getAttribute('qtype') || ''); } catch (e) { /* 忽略 */ }
+    }
+    if (!typeHint) {
+      try {
+        const n = el.querySelector('.newZy_TItle, .TiMuTitle, .mark_type, .colorShallow');
+        typeHint = (n && n.textContent) || '';
+      } catch (e) { /* 忽略 */ }
+    }
+    if (!typeHint) typeHint = sectionTitleOf(el);
+
+    const info = {
+      typeHint,
+      blankCount: o.blankCount,
+      blankStruct: blankStructureOf(el),
+      hasOptions: o.hasOptions,
+    };
+    try { info.hasCheckbox = !!el.querySelector('input[type="checkbox"]'); } catch (e) { info.hasCheckbox = false; }
+    try { info.hasRadio = !!el.querySelector('input[type="radio"]'); } catch (e) { info.hasRadio = false; }
+    return { type: decideQuestionType(info), typeHint: typeHint.replace(/\s+/g, ' ').trim().slice(0, 40) };
+  }
+  /* ==== 题型判定 END ==== */
+
   /* ==== 选项作答判读 BEGIN（bench/answered-state-test.js 会原样提取这一段来测）==== */
   /* 超星把每道题的答案放在 <input type="hidden" id="answer<qid>" name="answer<qid>"> 里，
      addChoice/addMultipleChoice 只改选项的 class + aria 再回写这个框。
@@ -8791,6 +9246,8 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
           <h4>答题 <span class="badge" id="modeBadge">${c.apiMode === 'custom' ? '自定义接口' : 'AI 直连'}</span></h4>
           <div class="row"><span>启用</span><input type="checkbox" id="answerEnabled" ${c.answerEnabled ? 'checked' : ''}></div>
           <div class="row"><span>题旁显示进度</span><input type="checkbox" id="showProgress" ${c.showProgress ? 'checked' : ''}></div>
+          <div class="row"><span>题旁「提示词作答」按钮</span><input type="checkbox" id="promptAskButton" ${c.promptAskButton ? 'checked' : ''}></div>
+          <p class="tip"><b>提示词作答</b>：每道题上方多一个按钮，点它自己写提示词，只让 AI 答这一题并把答案填进页面 —— <b>不会自动交卷</b>。提示词追加在内置提示词的后面（输出格式约定仍保留），留空就用面板里的默认提示词。和「题旁显示进度」是两个独立开关。</p>
           <div class="row"><span>发送题目图片</span><input type="checkbox" id="sendImages" ${c.sendImages !== false ? 'checked' : ''}></div>
           <p class="tip">题干/选项里的图片（超星把公式渲染成图片，纯图片选项更是只有图）会一起发给模型，<b>需要模型支持视觉</b>；网关拒绝时脚本会自动退回纯文本重试，不会因此一题都不答。</p>
           <div class="row"><span>作答方式</span>
@@ -8915,6 +9372,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       bindToggle('docEnabled', 'docEnabled');
       bindToggle('answerEnabled', 'answerEnabled');
       bindToggle('showProgress', 'showProgress');
+      bindToggle('promptAskButton', 'promptAskButton');
       bindToggle('sendImages', 'sendImages');
       bindToggle('dryRun', 'dryRun');
       bindToggle('autoSubmit', 'autoSubmit');
@@ -10749,7 +11207,7 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
       default:
         /* 未知 frame 也挂上观察：超星课程页有十几个小 iframe，URL 五花八门，谁也不能保证哪个里面不冒出题目。 */
         if (document.querySelector('video')) VideoModule.start();
-        else if (CONFIG.answerEnabled) WorkModule.watch();
+        else if (CONFIG.answerEnabled || CONFIG.promptAskButton) WorkModule.watch();
     }
 
     /* 「重新执行」的接收端：**所有** frame 都注册。 */
@@ -10763,11 +11221,15 @@ m02bUZvomA2ZLplVmVSZ35rhmuaa75rrmvua7Zr5mgibD5sTmx+bI5u9nr6eO36CnoeeiJ6LnpKe1pOd
 
     onConfigChanged = () => {
       if (VideoModule.video) VideoModule.applySettings();
-      if (isTop) Panel.setDot(CONFIG.videoEnabled || CONFIG.answerEnabled);
+      if (isTop) Panel.setDot(CONFIG.videoEnabled || CONFIG.answerEnabled || CONFIG.promptAskButton);
       // 答题开关从关变开时，让观察循环立刻起来（不用等页面刷新）
       if (CONFIG.answerEnabled && role === 'work' && !WorkModule.watching) WorkModule.restart();
+      /* 「提示词作答」只是一排按钮：开了也要有观察循环去挂它们（不请求接口）。 */
+      if (CONFIG.promptAskButton && !WorkModule.watching) WorkModule.watch();
       /* 关掉「题旁显示进度」时要立刻清掉已插入的徽标，否则页面上残留一批"AI 作答中…"的牌子，而功能其实已经关了 —— 用户会以为脚本还在跑。 */
       if (!CONFIG.showProgress) QProgress.clearAll();
+      /* 同理：关掉「提示词作答」按钮要立刻摘掉，否则页面上留着一排点了没用的按钮。 */
+      if (!CONFIG.promptAskButton) QAsk.clearAll();
     };
   }
 
